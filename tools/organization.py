@@ -2,7 +2,7 @@
 """Colony organisation over time from exported states files (LowRes.json format), to compare runs
 (e.g. Rapier vs Box2D). Standard library only.
 
-usage: python3 bacteria/tools/organization.py STATES.json [STATES2.json ...] [--every N] [--from STEP] [--to STEP]
+usage: python3 tools/organization.py STATES.json [STATES2.json ...] [--every N] [--from STEP] [--to STEP]
            [--snapshot-interval 300] [--wall-zone 20]
 
 Per sampled snapshot: number of cells, mean length (le), nematic order S = |<exp(2iθ)>| (0 = random

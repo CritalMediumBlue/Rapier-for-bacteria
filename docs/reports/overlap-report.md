@@ -64,8 +64,8 @@ Logs: `data/overlap-rapier-final-seed*-120k.csv`.
 
 ## Long run: 600 000 steps (seed 7, final defaults)
 
-`node bacteria/build/run.js --steps 600000 --seed 7 --overlap-log …` took 1 h 38 min (the overnight
-run took 2 h 32 min). It exported 2000 snapshots (`bacteria/output/states-rapier-600k-seed7.json`,
+`node build/run.js --steps 600000 --seed 7 --overlap-log …` took 1 h 38 min (the overnight
+run took 2 h 32 min). It exported 2000 snapshots (`output/states-rapier-600k-seed7.json`,
 189 MB, 105 780 cell ids; not in git). Log: `data/overlap-rapier-final-seed7-600k.csv`.
 
 | | |

@@ -3,7 +3,7 @@
 cell-cell penetration per snapshot, as % of the cell width, with the target line and the warm-up
 shaded. Standard library only; light and dark colours follow the viewer's colour scheme.
 
-usage: python3 bacteria/tools/overlap_chart.py LOG.csv OUT.svg [--title TEXT] [--warmup STEPS]
+usage: python3 tools/overlap_chart.py LOG.csv OUT.svg [--title TEXT] [--warmup STEPS]
            [--target FRACTION] [--width CELL_WIDTH] [--ymax PERCENT]
 """
 
@@ -43,7 +43,7 @@ def main():
     ap.add_argument("log"); ap.add_argument("out")
     ap.add_argument("--title", default="Cell–cell penetration per snapshot")
     ap.add_argument("--warmup", type=int, default=3000)
-    ap.add_argument("--target", type=float, default=0.05)
+    ap.add_argument("--target", type=float, default=0.08)  # OVERLAP_TARGET_FRACTION in src/overlap.ts
     ap.add_argument("--width", type=float, default=0.8)
     ap.add_argument("--ymax", type=float, default=None, help="y axis maximum in %% (default: max after warm-up, at least 1.2 x target)")
     a = ap.parse_args()

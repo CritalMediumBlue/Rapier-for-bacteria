@@ -1,77 +1,158 @@
-# Microfluidic biofilm simulation
+# Rapier for bacteria
 
-Rod-shaped bacteria growing and dividing in a chamber. Runs on [Rapier](https://rapier.rs)
-(default) or on the Box2D library in `../src` (the original implementation, kept for comparison).
-See NOTES.md for the port: design decisions, differences from Box2D, performance and overlap results.
+Rod-shaped bacteria growing, dividing and pushing each other as a monolayer in a microfluidic
+chamber (100 × 60 units, open at the bottom). Cells near the side walls can attach to the
+surface. The mechanics run on the [Rapier](https://rapier.rs) 2D physics engine, in its
+WebAssembly SIMD build (`@dimforge/rapier2d-simd-compat`), so the same code runs in the browser
+and on the command line.
 
-```
-bacteria/
-  src/model.ts              parameters (DEFAULT_PARAMS), chamber geometry, cell mass, the Simulation interface
-  src/rapier-simulation.ts  the model on Rapier
-  src/box2d-simulation.ts   the model on Box2D
-  src/engines.ts            createSimulation(engine, params)
-  src/overlap.ts            cell-cell and cell-wall penetration depth (overlap check)
-  src/states.ts             state recording in the LowRes.json format
-  src/rng.ts                seeded random numbers (same seed -> same run)
-  src/run.ts                command-line runner (Node)
-  src/render.ts             drawing (simple / diagnostic views), separate from physics
-  src/viewer.ts             browser viewer
-  index.html                viewer page
-  tools/overlap_report.py   summarise an overlap log as Markdown
-```
+**Live demo:** https://critalmediumblue.github.io/Rapier-for-bacteria/
 
-## Build
+## Quick start
+
+Requires Node.js 22 or newer and npm. In the browser, it needs WebAssembly SIMD: any current
+Chrome, Edge, Firefox or Safari (Chrome 91, Firefox 89 and Safari 16.4 or newer).
 
 ```sh
-npm run build-bacteria      # builds the library (ES modules) and this folder
+git clone https://github.com/CritalMediumBlue/Rapier-for-bacteria.git
+cd Rapier-for-bacteria
+npm install                 # Rapier, TypeScript, and a small web server
+npm run build               # compiles src/*.ts into build/*.js
+npm start                   # opens the simulation in your browser
+npm run simulate -- --steps 3000 --seed 7 --out output/states.json   # or run it without a browser
 ```
 
-After changing only files in `bacteria/src`, `npm run watch-bacteria` rebuilds automatically.
+## How the code is organised
 
-## Run without a browser
+All the code is in `src/` (about 1 800 lines of TypeScript). Read it in this order:
+
+| File | What it does |
+|---|---|
+| [`src/model.ts`](src/model.ts) | **The model**: every parameter with its default and an explanation (`DEFAULT_PARAMS`), the chamber geometry, and the formulas for cell mass and drag. No physics engine here. |
+| [`src/simulation.ts`](src/simulation.ts) | **The simulation**: the `Simulation` class puts the model on Rapier. Each step: Rapier resolves contacts, then cells grow, divide, leave or die, and may attach to the wall. Records snapshots. |
+| [`src/states.ts`](src/states.ts) | Records snapshots and the lineage, and writes them as JSON (format below). |
+| [`src/rng.ts`](src/rng.ts) | Seeded random numbers: the same seed gives the same run. |
+| [`src/overlap.ts`](src/overlap.ts) | Quality check: how deep cells penetrate each other and the walls (should stay below 8% of the cell width). |
+| [`src/run.ts`](src/run.ts) | **Command-line entry point** (Node): runs a simulation and saves the states to disk. |
+| [`src/viewer.ts`](src/viewer.ts) | **Browser entry point**: runs the simulation, the controls on [`index.html`](index.html), saving. |
+| [`src/render.ts`](src/render.ts) | Draws the chamber and the cells on a canvas (no physics). |
+
+```
+          run.ts (Node)           viewer.ts (browser) ── render.ts
+                 \                  /
+                  simulation.ts ── overlap.ts
+                 /      |      \
+          model.ts   states.ts   rng.ts          + Rapier (npm: @dimforge/rapier2d-simd-compat)
+```
+
+`simulation.ts`, `model.ts`, `states.ts`, `rng.ts` and `overlap.ts` use no browser or Node APIs;
+only the two entry points do. The rest of the repository:
+
+| Path | |
+|---|---|
+| `index.html` | the web page (loads `build/viewer.js`) |
+| `tools/build-site.sh` | assembles the static website in `_site/` |
+| `tools/*.py` | analysis of output files (Python 3, standard library only): overlap reports and charts, colony organisation |
+| `tools/rapier-stale-contacts.mjs` | minimal reproduction of the Rapier bug that `simulation.ts` works around (see `resizeCollider`) |
+| `docs/NOTES.md` | why the model is the way it is: design decisions, solver settings, performance, validation |
+| `docs/reports/` | the overlap validation: report, CSV logs and charts |
+| `.github/workflows/deploy-pages.yml` | publishes the website on every push to `main` |
+
+### Using the simulation from your own code
+
+```ts
+import { Simulation } from "./simulation.js";
+
+const sim = await Simulation.create({ seed: 7, rate: 0.002 });   // any parameter from DEFAULT_PARAMS
+while (sim.stepCount < 3000) { sim.step(); }
+sim.forEachCell((x, y, angle, length) => { /* ... */ });
+```
+
+## Run in the browser
+
+`npm start` serves the repository and opens `index.html`. Space pauses, N advances one step, J
+saves the states. The header sets the steps per frame, the view (simple outlines, or diagnostic,
+which highlights overlapping cells), the seed and the snapshot interval.
+
+URL parameters set the same things, plus any model parameter by name, for example
+`index.html?seed=7&speed=20&style=diagnostic&anchorMaxStretch=1`. `view=minX,minY,maxX,maxY`
+zooms into a part of the chamber. `window.biofilm` gives scripts the simulation, the latest
+overlap, timing and `download()`.
+
+Saving: in Chrome and Edge you pick a file once, and it is then overwritten automatically every
+500 snapshots; other browsers download numbered copies.
+
+## Run on the command line
 
 ```sh
-npm run run-bacteria -- --steps 600000 --out states.json --seed 42
-node bacteria/build/run.js --help              # all options
-node bacteria/build/run.js --list-params       # all parameters and defaults
-node bacteria/build/run.js --steps 30000 --set rate=0.002 --set anchorLifetimeSteps=6000
-node bacteria/build/run.js --steps 30000 --engine box2d          # the original engine
-node bacteria/build/run.js --steps 60000 --overlap-log overlap.csv --overlap-check
-python3 bacteria/tools/overlap_report.py overlap.csv
+node build/run.js --steps 600000 --seed 7 --out output/states.json
+node build/run.js --help              # all options
+node build/run.js --list-params       # all model parameters and their defaults
+node build/run.js --steps 30000 --set rate=0.002 --set anchorMaxStretch=1   # override parameters
+node build/run.js --steps 60000 --overlap-log output/overlap.csv --overlap-check
+python3 tools/overlap_report.py output/overlap.csv
 ```
 
-- The file is rewritten in full every `--save-every` snapshots (default 500) and at the end, via a
-  temporary file, so it is always complete and valid. Ctrl+C stops the run and saves.
-- The seed is printed at the start; pass it again with `--seed` to reproduce a run exactly.
+(`npm run simulate -- <options>` is the same as `node build/run.js <options>`.)
+
+- The output file is rewritten in full every `--save-every` snapshots (default 500) and at the
+  end, via a temporary file, so it is always valid JSON. Ctrl+C stops the run and saves.
+- The seed is printed at the start; pass it again with `--seed` to repeat a run exactly.
 - Runs are independent, so several can run in parallel (one per CPU core).
-- `--overlap-log` measures the penetration depth of every touching pair of cells (and of cells into
-  the walls) at each snapshot, at full precision, and writes one CSV row per snapshot. The target is
-  max depth < 8% of the cell width after a warm-up of 3000 steps (the random initial placement
-  overlaps heavily); `--overlap-check` exits with status 3 if it is missed.
+- `--overlap-log` writes the penetration depth of every touching pair of cells, at each snapshot,
+  as CSV. `--overlap-check` exits with status 3 if the deepest pair exceeds 8% of the cell width
+  after a 3000-step warm-up (the random initial placement overlaps heavily). `--timing-log`
+  writes the time per step.
 
-## Watch it in the browser
-
-```sh
-npm run start-bacteria      # serves the repo and opens bacteria/index.html
-```
-
-Space pauses, N steps once, J saves. In Chrome/Edge, J asks for a file once and then that file is
-overwritten automatically every 500 snapshots; otherwise auto-save downloads numbered copies.
-
-The header has the view style (simple: cell outlines, walls and joints as lines; diagnostic:
-overlapping cells in orange, deeper than the target in red), the engine and the snapshot interval (both apply on
-Restart), and shows the overlap at the last snapshot. URL parameters set the same things, plus any
-simulation parameter: `index.html?engine=box2d&seed=7&style=diagnostic&speed=20&snapshotInterval=600`.
-`window.biofilm` gives scripts the simulation, the latest overlap, timing, and `download()`.
-
-## Output format (same as LowRes.json)
+## Output format
 
 ```json
 {"1":[{"x":3.99,"y":166.12,"id":1,"an":0.46,"le":3.7}, ...], "2":[...], ..., "lineage":{"1":0, ...}}
 ```
 
-- Snapshot keys count snapshots (every `snapshotInterval` = 300 steps, a multiple of `growthInterval` = 25); cells are sorted by id.
+- One snapshot every `snapshotInterval` steps (default 300; a multiple of `growthInterval` = 25).
+  Snapshot keys count snapshots ("1", "2", ...); cells are sorted by id.
 - `x`, `y`: cell centre. `an`: orientation as a fraction of π (0–1). `le`: distance between the
-  end-cap centres (tip-to-tip length is `le + 2 * radius`). All rounded to 2 decimals.
-- `id`: sequential, never reused. `lineage`: child id -> parent id (0 for the initial cells). Cells
-  that divide or leave between two snapshots appear in `lineage` but in no snapshot.
+  end-cap centres (cell length = `le` + 0.8, the cell width). All rounded to 2 decimals.
+- `id`: sequential, never reused. `lineage`: each cell id → its mother's id (0 for the initial
+  cells). Cells that divide or leave between two snapshots appear in `lineage` but in no snapshot.
+- A run cannot be resumed from this file (it holds rounded positions, not the full physics state).
+  To reproduce a run, run it again with the same seed and parameters.
+  `python3 tools/organization.py FILE` computes cell counts and alignment from it.
+
+## Reproducibility
+
+- Same seed, parameters and machine → byte-identical output. Results depend on the Rapier
+  version, so it is pinned exactly in `package.json` (0.21.0) and printed at the start of a run.
+  The SIMD build gave byte-identical output to Rapier's plain build (`rapier2d-compat`, used
+  before 17 November 2026) in a 20 000-step test, at about half the time per step. Rapier makes no
+  promise of identical results across machines; its `rapier2d-deterministic` build does, but is
+  slower.
+- Defaults: 1000 initial cells, 60 steps per simulated second, cell width 0.8, growth every 25
+  steps, 8 solver iterations. Every parameter is documented in `src/model.ts`.
+- Expected output: `--steps 3000` gives 10 snapshots and ~970 cells. The chamber fills after
+  ~12 000 steps and then holds ~1700–1800 cells. With a full chamber a step takes ~5 ms on one
+  core of a Xeon E-2246G (~10 ms with the plain build). 600 000 steps give a ~190 MB file with
+  2000 snapshots; they took ~1 h 40 min with the plain build.
+
+## The website
+
+Every push to `main` builds the page and publishes it on GitHub Pages
+(`.github/workflows/deploy-pages.yml`). This needs, once, in the repository's
+**Settings → Pages → Build and deployment → Source: GitHub Actions**.
+
+To build the site locally: `npm run build-site`, then `npx http-server _site`. The site is
+`index.html`, `build/*.js` and Rapier's single JavaScript file (the WebAssembly is inlined in it),
+about 3.4 MB; it needs no server-side code.
+
+## History
+
+The model was first written on Box2D (in
+[box2d_for_bacteria](https://github.com/CritalMediumBlue/box2d_for_bacteria), which keeps the
+original implementation) and then ported to Rapier. This repository continues the Rapier version
+only, with the history of its files. Comments that mention "the testbed" refer to that original
+Box2D implementation; `docs/NOTES.md` describes the port and every model change since.
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). Rapier is licensed under Apache-2.0.

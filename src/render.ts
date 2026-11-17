@@ -12,7 +12,8 @@
  * drawing allocates little. Line widths are in screen pixels, whatever the zoom.
  */
 
-import { CHAMBER, Point, RGB, Simulation } from "./model.js";
+import { CHAMBER, Point, RGB } from "./model.js";
+import type { Simulation } from "./simulation.js";
 
 export type RenderStyle = "simple" | "diagnostic";
 export const RENDER_STYLES: RenderStyle[] = ["simple", "diagnostic"];

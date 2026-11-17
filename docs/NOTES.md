@@ -3,6 +3,17 @@
 Overnight work log for porting the microfluidic biofilm simulation from the Box2D port to
 [Rapier](https://rapier.rs) (`@dimforge/rapier2d-compat` 0.21.0, 2D, WebAssembly).
 
+> **Context.** This log was written in the
+> [box2d_for_bacteria](https://github.com/CritalMediumBlue/box2d_for_bacteria) repository, while
+> both engines were still in the code. That repository keeps the Box2D implementation; this one
+> keeps only Rapier. File paths and parameter names below have been updated to this repository
+> (the Rapier solver parameters lost their `rapier` prefix, e.g. `rapierContactFrequency` is now
+> `contactFrequency`). Mentions of `--engine box2d` and Box2D runs describe that earlier setup.
+> All timings below were measured with Rapier's plain build (`@dimforge/rapier2d-compat`). Since
+> 17 November 2026 the repository uses the SIMD build (`@dimforge/rapier2d-simd-compat`, same
+> version), which gives byte-identical output in about half the time per step (5.1 vs 9.9 ms with
+> a full chamber, measured side by side).
+
 ## Status (14 November, afternoon)
 
 - **Done:** Rapier is the default engine, with the full model, in the browser and on the command
@@ -33,10 +44,10 @@ Overnight work log for porting the microfluidic biofilm simulation from the Box2
   leak in that workaround (see "Rapier contact bug"); also a fixed cost on every step in which
   colliders change (see "Performance").
 - **Deliverables:**
-  - long-run state file `bacteria/output/states-rapier-600k-seed7.json` (gitignored):
+  - long-run state file `output/states-rapier-600k-seed7.json` (gitignored):
     2000 snapshots (one every 300 steps), 105 780 cell ids, seed 7, final defaults, 189 MB.
     Earlier long runs are kept for comparison:
-    `bacteria/output/states-rapier-600k-seed7-anchorhold.json` (overnight; anchors never let go;
+    `output/states-rapier-600k-seed7-anchorhold.json` (overnight; anchors never let go;
     187 MB, 2000 snapshots) and `…-kickdrag-partial.json` (anchors let go, drag kick; stopped at
     ~238 000 steps when the drag changed; holds the first 500 snapshots, to step 150 000);
   - `reports/overlap-report.md`, with the CSV logs in `reports/data/` and charts;
@@ -44,28 +55,11 @@ Overnight work log for porting the microfluidic biofilm simulation from the Box2
 
 ## How to run
 
-```sh
-npm install
-npm run build-bacteria                      # library (ES modules) + bacteria/
-
-# Browser: serves the repo and opens bacteria/index.html
-npm run start-bacteria
-#   URL options: ?engine=rapier|box2d&seed=7&style=simple|diagnostic&speed=20
-#   and any parameter by name, e.g. &snapshotInterval=600&rapierContactFrequency=120
-
-# Command line (Rapier by default)
-node bacteria/build/run.js --steps 600000 --seed 7 --out bacteria/output/states.json \
-     --overlap-log bacteria/output/overlap.csv --overlap-check
-node bacteria/build/run.js --list-params    # every parameter and its default
-node bacteria/build/run.js --engine box2d --steps 30000 ...   # the original engine, for comparison
-```
-
-`--overlap-check` makes the run exit with status 3 if the overlap target is missed after the
-warm-up. `python3 bacteria/tools/overlap_report.py overlap.csv` summarises an overlap log.
+See the [README](../README.md).
 
 ## What was implemented
 
-- **Rapier engine** (`src/rapier-simulation.ts`): the full model (growth, division, random death,
+- **Rapier engine** (`src/simulation.ts`): the full model (growth, division, random death,
   cells leaving through the open bottom and the sides, wall-zone growth rate and colour, surface
   anchors that expire, snapshots, lineage) on Rapier, with capsule colliders.
 - **Engine-independent core** (`src/model.ts`): all parameters, chamber geometry, cell mass, and the
@@ -118,16 +112,16 @@ full — then grows straight into its neighbours and the walls while the contact
 Overlap rose steadily once the chamber filled (mean penetration 0.2% → 6% of the width over
 25 000 steps). `tools/rapier-stale-contacts.mjs` is a minimal reproduction.
 
-- Fix (`rapierRefreshContacts=1`, default): replace the cell's collider on every growth step, which
+- Fix (`refreshContacts=1`, default): replace the cell's collider on every growth step, which
   gives it fresh contacts. **Rapier 0.21 leaks WebAssembly memory** doing this when the collider
   touches others (~13 MB per 1000 steps with ~1700 cells; colliders that touch nothing don't leak):
   the first 600 000-step run aborted at step ~231 500 with a WebAssembly "unreachable" trap when
   the 4 GB heap ran out. Freeing a world gives the memory back, so every
-  `rapierRebuildInterval` (10 000) steps the simulation moves all cells, anchors and walls into a
+  `rebuildInterval` (10 000) steps the simulation moves all cells, anchors and walls into a
   fresh Rapier world with identical state (positions, angles, velocities, masses, colliders,
   springs) and frees the old one. A probe that replaces 1700 touching colliders every 25 steps
   plateaus at ~430 MB this way.
-- Tried and kept as an option (`rapierRefreshContacts=2`): resize in place and turn the collider by
+- Tried and kept as an option (`refreshContacts=2`): resize in place and turn the collider by
   π on its body (same capsule in the world, no allocation). Most contacts are recomputed, but some
   between two cells that both turned are not; validation (3 seeds × 120 000 steps): 2 / 2 / 8 of
   391 snapshots over the overlap target (worst 11%) instead of 0 / 0 / 0.
@@ -247,8 +241,8 @@ new model (3 seeds × 120 000 steps, 720 Hz; details in the overlap report):
 At 4 iterations a stiffer contact (1440 Hz) was worse than 720 Hz (worst 10.4% vs 4.9% on seed 7),
 and at 6 iterations it made no difference.
 
-Contact stiffness can be changed per run (`--set rapierContactFrequency=…`,
-`rapierSolverIterations`, `rapierSubsteps`, `rapierPgsIterations`).
+Contact stiffness can be changed per run (`--set contactFrequency=…`,
+`solverIterations`, `substeps`, `pgsIterations`).
 
 ## Rendering
 
@@ -432,7 +426,7 @@ slow), so longer-term organisation was not compared.
    distance would match that better. The release distance (2 units) is a model parameter; 1 unit
    was also tested (see "Changes to the model").
 3. **Rapier contact bug** (`tools/rapier-stale-contacts.mjs`, a minimal reproduction; not reported
-   upstream, by decision). If a later Rapier version fixes it, `rapierRefreshContacts=0` saves
+   upstream, by decision). If a later Rapier version fixes it, `refreshContacts=0` saves
    5–12% of the step time and makes world rebuilds unnecessary; the reproduction script shows
    whether a version is fixed.
 4. **Drag strength.** Drag is now continuous, with the testbed's time-averaged strength. It is
@@ -449,6 +443,6 @@ slow), so longer-term organisation was not compared.
    each other for the whole run, and it never resolves them (see the overlap report).
 8. **Memory still creeps up slowly** (~1.2 GB after 600 000 steps; see Performance). Runs of a few
    million steps in one process could approach the 4 GB WebAssembly limit. Options: a shorter
-   `rapierRebuildInterval`, or re-creating the WebAssembly module from a saved state. Not
+   `rebuildInterval`, or re-creating the WebAssembly module from a saved state. Not
    investigated further. A crash still saves the snapshots recorded so far.
 9. **Not done:** Web Worker for the physics in the browser; cross-machine determinism check.

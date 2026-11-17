@@ -1,9 +1,9 @@
 /**
  * Browser viewer: runs the simulation, draws it (render.ts), measures overlaps, and saves states.
  *
- * URL parameters (all optional): engine=rapier|box2d, seed=N, style=simple|diagnostic,
- * speed=steps per frame, view=minX,minY,maxX,maxY (zoom into a world area, e.g. view=-50,185,-35,200 for
- * the top-left corner), and any simulation parameter by name (e.g. snapshotInterval=600).
+ * URL parameters (all optional): seed=N, style=simple|diagnostic, speed=steps per frame,
+ * view=minX,minY,maxX,maxY (zoom into a world area, e.g. view=-50,185,-35,200 for the top-left
+ * corner), and any simulation parameter by name (e.g. snapshotInterval=600).
  *
  * Saving ("J" or the button): in Chrome/Edge you pick a file once; it is written immediately and
  * overwritten automatically every AUTO_SAVE_EVERY_SNAPSHOTS snapshots. Without a picked file
@@ -13,10 +13,10 @@
  * overlap stats, timing, and download().
  */
 
-import { DEFAULT_ENGINE, createSimulation, isEngine } from "./engines.js";
-import { DEFAULT_PARAMS, Engine, Simulation, SimulationParams } from "./model.js";
+import { DEFAULT_PARAMS, SimulationParams } from "./model.js";
 import { OVERLAP_TARGET_FRACTION, OVERLAP_WARMUP_STEPS, OverlapMeter, OverlapStats } from "./overlap.js";
 import { ChamberRenderer, RENDER_STYLES, RenderStyle, ViewRect } from "./render.js";
+import { Simulation, rapierVersion } from "./simulation.js";
 
 const AUTO_SAVE_EVERY_SNAPSHOTS = 500;
 /** Diagnostic view: overlaps deeper than this fraction of the cell width are highlighted. */
@@ -37,7 +37,6 @@ const overlapEl = $("overlap");
 const pauseBtn = $<HTMLButtonElement>("pause");
 const speedInput = $<HTMLInputElement>("speed");
 const seedInput = $<HTMLInputElement>("seed");
-const engineSelect = $<HTMLSelectElement>("engine");
 const styleSelect = $<HTMLSelectElement>("style");
 const snapshotInput = $<HTMLInputElement>("snapshotInterval");
 
@@ -50,8 +49,6 @@ for (const [key, value] of query) {
     (urlOverrides as Record<string, number>)[key] = Number(value);
   }
 }
-const urlEngine = query.get("engine");
-engineSelect.value = urlEngine && isEngine(urlEngine) ? urlEngine : DEFAULT_ENGINE;
 const urlStyle = query.get("style") as RenderStyle | null;
 styleSelect.value = urlStyle && RENDER_STYLES.includes(urlStyle) ? urlStyle : "simple";
 if (query.get("seed")) { seedInput.value = query.get("seed")!; }
@@ -79,9 +76,8 @@ async function startSimulation(): Promise<void> {
   const seedText = seedInput.value.trim();
   const overrides: Partial<SimulationParams> = { ...urlOverrides, snapshotInterval: Number(snapshotInput.value) };
   if (seedText !== "") { overrides.seed = Number(seedText); }
-  const engine = engineSelect.value as Engine;
   try {
-    sim = await createSimulation(engine, overrides);
+    sim = await Simulation.create(overrides);
   } catch (e) {
     statusEl.textContent = `could not start: ${e instanceof Error ? e.message : String(e)}`;
     console.error(e);
@@ -89,7 +85,7 @@ async function startSimulation(): Promise<void> {
   }
   lastOverlap = null;
   pairsStep = -1;
-  console.log(`Simulation started: ${sim.engine}, seed ${sim.params.seed}`);
+  console.log(`Simulation started: Rapier ${rapierVersion()}, seed ${sim.params.seed}`);
 }
 
 // ---------------------------------------------------------------- simulation loop
@@ -166,7 +162,7 @@ function render(): void {
     `step ${sim.stepCount} · ${sim.cellCount} cells · ${sim.states.snapshotCount} snapshots · ` +
     `${stepsPerSecond.toFixed(0)} steps/s · ${framesPerSecond.toFixed(0)} fps ` +
     `(step ${stepMsPerFrame.toFixed(1)} ms + draw ${drawMsPerFrame.toFixed(1)} ms per frame) · ` +
-    `${sim.engine} · seed ${sim.params.seed} · ${lastSaveInfo}`;
+    `seed ${sim.params.seed} · ${lastSaveInfo}`;
   if (lastOverlap) {
     const width = 2 * radius;
     const max = lastOverlap.maxDepth / width * 100, mean = lastOverlap.meanDepth / width * 100;

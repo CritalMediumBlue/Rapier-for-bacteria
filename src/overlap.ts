@@ -9,7 +9,8 @@
  * overlap by 2·radius − (distance between their segments) when that is positive.
  */
 
-import { CHAMBER, Simulation } from "./model.js";
+import { CHAMBER } from "./model.js";
+import type { Simulation } from "./simulation.js";
 
 /**
  * Target: max cell–cell penetration below this fraction of the cell width. Originally 0.05; relaxed

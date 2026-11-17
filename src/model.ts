@@ -1,34 +1,27 @@
 /**
- * Engine-independent part of the microfluidic biofilm model: parameters, chamber geometry,
- * cell mass, and the interface every physics engine implementation provides.
+ * The model, independent of the physics engine: every parameter with its default, the chamber
+ * geometry, and the formulas for cell mass and drag. simulation.ts puts it on Rapier.
  *
- * Implementations: box2d-simulation.ts (the original) and rapier-simulation.ts.
- * Pick one with createSimulation() in engines.ts.
+ * History: the model was first written on Box2D (a TypeScript port, in the box2d_for_bacteria
+ * repository). Comments call that original "the testbed", and where Box2D's own formulas set a
+ * value (cell mass, friction mixing, spring constants) they are reproduced here so the model
+ * keeps the same mechanics. docs/NOTES.md explains every change since.
  */
 
-import { StateRecorder } from "./states.js";
-
-export const ENGINES = ["box2d", "rapier"] as const;
-export type Engine = typeof ENGINES[number];
-
-/** All tunable parameters. Override any of them via the constructor (or `--set` in run.js). */
+/** All tunable parameters. Override any of them when creating a Simulation (or with `--set` in run.js). */
 export const DEFAULT_PARAMS = {
 	// --- physics stepping ---
 	hertz: 60, // time step = 1 / hertz
-	// Box2D only (same values the testbed used)
-	velocityIterations: 20,
-	positionIterations: 20,
-	particleIterations: 10,
-	// Rapier only. Defaults chosen by sweeping for the overlap target (NOTES.md): Rapier's own defaults
-	// (4 iterations, 30 Hz) let a packed colony compress far beyond it.
-	rapierSubsteps: 1, // world.step() calls per simulation step, each 1 / (hertz * rapierSubsteps) long
-	rapierSolverIterations: 8, // Rapier's default: 4
-	rapierPgsIterations: 1, // Rapier's default
-	rapierContactFrequency: 720, // contact stiffness (natural frequency, Hz); 0 = Rapier's default (30)
+	// Rapier solver. Defaults chosen by sweeping for the overlap target (docs/NOTES.md): Rapier's own
+	// defaults (4 iterations, 30 Hz) let a packed colony compress far beyond it.
+	substeps: 1, // world.step() calls per simulation step, each 1 / (hertz * substeps) long
+	solverIterations: 8, // Rapier's default: 4
+	pgsIterations: 1, // Rapier's default
+	contactFrequency: 720, // contact stiffness (natural frequency, Hz); 0 = Rapier's default (30)
 	// How a growing cell gets fresh contacts (Rapier keeps stale ones otherwise; see resizeCollider in
-	// rapier-simulation.ts): 1 = replace its collider, 2 = turn it by pi, 0 = nothing
-	rapierRefreshContacts: 1,
-	rapierRebuildInterval: 10000, // with rapierRefreshContacts = 1: rebuild the Rapier world every N steps (0 = never)
+	// simulation.ts): 1 = replace its collider, 2 = turn it by pi, 0 = nothing
+	refreshContacts: 1,
+	rebuildInterval: 10000, // with refreshContacts = 1: rebuild the Rapier world every N steps (0 = never)
 
 	// --- chamber ---
 	minX: -50, maxX: 50, // cells leaving this range are removed
@@ -119,6 +112,9 @@ export function checkParams(p: SimulationParams): void {
 	if (!Number.isInteger(p.growthGroups) || p.growthGroups < 1 || p.growthInterval % p.growthGroups !== 0) {
 		throw new Error(`growthGroups must be a positive integer that divides growthInterval (${p.growthInterval}); got ${p.growthGroups}`);
 	}
+	if (!Number.isInteger(p.substeps) || p.substeps < 1) {
+		throw new Error(`substeps must be a positive integer (got ${p.substeps})`);
+	}
 }
 
 // ---------------------------------------------------------------- chamber geometry
@@ -187,7 +183,7 @@ export function dragFraction(coefficient: number, massOrInertia: number, dt: num
  * impulse of DRAG_APPLICATIONS_PER_CELL · coefficient · velocity · dt once every growthInterval
  * steps; spread over those steps, that is a force of DRAG_APPLICATIONS_PER_CELL · coefficient /
  * growthInterval times the velocity, i.e. this rate for the given mass (or rotational inertia).
- * Both engines apply damping as v ← v / (1 + dt · rate) every step.
+ * Rapier (like Box2D) applies damping as v ← v / (1 + dt · rate) every step.
  */
 export function continuousDampingRate(coefficient: number, massOrInertia: number, growthInterval: number): number {
 	return DRAG_APPLICATIONS_PER_CELL * coefficient / (growthInterval * massOrInertia);
@@ -210,23 +206,4 @@ export function cellMassProperties(length: number, radius: number, density: numb
 /** Orientation as a fraction of π in [0, 1]. */
 export function orientationOf(angle: number): number {
 	return angle > 0 ? (angle / Math.PI) % 1 : 1 + (angle / Math.PI) % 1;
-}
-
-// ---------------------------------------------------------------- engine interface
-
-/** What the runner and the viewer need from a simulation, whatever the physics engine. */
-export interface Simulation {
-	readonly engine: Engine;
-	readonly params: SimulationParams;
-	readonly states: StateRecorder;
-	/** Number of simulation steps taken so far. */
-	readonly stepCount: number;
-	/** Number of bacteria currently in the world. */
-	readonly cellCount: number;
-	/** Advance one simulation step. Returns true if a snapshot was taken. */
-	step(): boolean;
-	/** Each cell's centre, angle, end-cap centre distance, colour and id, at full precision. */
-	forEachCell(fn: (x: number, y: number, angle: number, length: number, color: RGB, id: number) => void): void;
-	/** For drawing: each anchor point, with the centre of the cell it holds (if that cell still exists). */
-	forEachAnchor(fn: (x: number, y: number, cell: Point | null) => void): void;
 }

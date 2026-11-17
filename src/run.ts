@@ -1,26 +1,25 @@
 /**
  * Command-line runner: simulate without a browser and write states to disk.
  *
- *   node bacteria/build/run.js --steps 600000 --out states.json [--seed 42] [--save-every 500]
- *                              [--engine rapier|box2d] [--set rate=0.002 --set anchorLifetimeSteps=6000 ...]
- *                              [--overlap-log overlap.csv [--overlap-check]]
+ *   node build/run.js --steps 600000 --out states.json [--seed 42] [--save-every 500]
+ *                     [--set rate=0.002 --set anchorLifetimeSteps=6000 ...]
+ *                     [--overlap-log overlap.csv [--overlap-check]]
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { DEFAULT_ENGINE, createSimulation, isEngine } from "./engines.js";
-import { DEFAULT_PARAMS, ENGINES, Engine, Simulation, SimulationParams } from "./model.js";
+import { DEFAULT_PARAMS, SimulationParams } from "./model.js";
 import {
   OVERLAP_CSV_HEADER, OVERLAP_TARGET_FRACTION, OVERLAP_WARMUP_STEPS, OverlapMeter, OverlapStats, overlapCsvRow,
 } from "./overlap.js";
+import { Simulation, rapierVersion } from "./simulation.js";
 
-const USAGE = `Usage: node bacteria/build/run.js --steps N [options]
+const USAGE = `Usage: node build/run.js --steps N [options]
 
 Options:
   --steps N         number of simulation steps to run (required)
   --out FILE        output file (default: states.json)
-  --engine NAME     physics engine: ${ENGINES.join(" or ")} (default: ${DEFAULT_ENGINE})
-  --seed N          random seed (default: random; printed at start)
+  --seed N         random seed (default: random; printed at start)
   --save-every N    also save after every N snapshots (default: 500; 0 = only at the end)
   --set KEY=VALUE   override a simulation parameter (repeatable), e.g. --set rate=0.002
   --list-params     print all parameters with their defaults and exit
@@ -46,7 +45,7 @@ function fail(message: string): never {
 
 function parseArgs(argv: string[]) {
   const opts = {
-    steps: NaN, out: "states.json", saveEvery: 500, engine: DEFAULT_ENGINE as Engine,
+    steps: NaN, out: "states.json", saveEvery: 500,
     overrides: {} as Partial<SimulationParams>,
     overlapLog: null as string | null, overlapWarmup: OVERLAP_WARMUP_STEPS, overlapTarget: OVERLAP_TARGET_FRACTION,
     overlapCheck: false, timingLog: null as string | null,
@@ -65,12 +64,6 @@ function parseArgs(argv: string[]) {
     switch (arg) {
       case "--steps": opts.steps = int(value()); break;
       case "--out": opts.out = value(); break;
-      case "--engine": {
-        const name = value();
-        if (!isEngine(name)) { fail(`unknown engine "${name}" (choose ${ENGINES.join(" or ")})`); }
-        opts.engine = name;
-        break;
-      }
       case "--seed": opts.overrides.seed = int(value()); break;
       case "--save-every": opts.saveEvery = int(value()); break;
       case "--set": {
@@ -141,12 +134,12 @@ async function main(): Promise<void> {
   }
   let sim: Simulation;
   try {
-    sim = await createSimulation(opts.engine, opts.overrides);
+    sim = await Simulation.create(opts.overrides);
   } catch (e) {
     fail(e instanceof Error ? e.message : String(e));
   }
 
-  console.error(`${sim.engine}, seed ${sim.params.seed}, ${opts.steps} steps, snapshot every ${sim.params.snapshotInterval} steps -> ${out}`);
+  console.error(`Rapier ${rapierVersion()}, seed ${sim.params.seed}, ${opts.steps} steps, snapshot every ${sim.params.snapshotInterval} steps -> ${out}`);
   const changed = Object.entries(opts.overrides).filter(([k]) => k !== "seed");
   if (changed.length > 0) { console.error(`overrides: ${changed.map(([k, v]) => `${k}=${v}`).join(", ")}`); }
 
@@ -230,7 +223,7 @@ async function main(): Promise<void> {
   if (sim.states.snapshotCount !== savedAtSnapshot) { save(sim, out); }
   const seconds = (Date.now() - start) / 1000;
   console.error(`done in ${formatDuration(seconds)}, ${(sim.stepCount / seconds).toFixed(0)} steps/s average, ` +
-    `${sim.cellCount} cells at the end (${sim.engine}, seed ${sim.params.seed})`);
+    `${sim.cellCount} cells at the end (seed ${sim.params.seed})`);
 
   if (timingFd !== null) { fs.closeSync(timingFd); }
   if (overlapFd !== null) {

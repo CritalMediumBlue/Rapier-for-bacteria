@@ -29,10 +29,6 @@
       <option value="simple">Simple</option>
       <option value="diagnostic">Diagnostic (overlaps)</option>
     </select></label>
-    <label>Engine <select id="engine" title="Applies on Restart">
-      <option value="rapier">Rapier</option>
-      <option value="box2d">Box2D</option>
-    </select></label>
     <label>Seed <input id="seed" type="number" min="0" placeholder="random"></label>
     <label title="Steps between snapshots (multiple of 25); applies on Restart">Snapshot every <input id="snapshotInterval" type="number" min="25" step="25" value="300"> steps</label>
     <button id="restart" title="Restart with these settings (blank seed = random); unsaved states are lost">Restart</button>
@@ -41,8 +37,10 @@
     <span style="color:#888"><kbd>Space</kbd> pause · <kbd>N</kbd> step · <kbd>J</kbd> save</span>
   </header>
   <canvas id="canvas"></canvas>
+  <!-- The compiled TypeScript imports Rapier by its npm name; this tells the browser where the file
+       is. tools/build-site.sh copies it to the same path in the published site. -->
   <script type="importmap">
-    { "imports": { "@dimforge/rapier2d-compat": "../node_modules/@dimforge/rapier2d-compat/dist/rapier.mjs" } }
+    { "imports": { "@dimforge/rapier2d-simd-compat": "./node_modules/@dimforge/rapier2d-simd-compat/dist/rapier.mjs" } }
   </script>
   <script type="module" src="./build/viewer.js"></script>
 </body>

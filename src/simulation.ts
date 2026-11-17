@@ -1,27 +1,40 @@
 /**
- * Microfluidic biofilm simulation on the Rapier physics engine (2D, WebAssembly).
+ * The microfluidic biofilm simulation on the Rapier physics engine (2D, WebAssembly).
  *
- * Same model as box2d-simulation.ts, step for step: growth, division, removal, drag, anchors and
- * snapshots happen at the same moments, with the same formulas, and draw random numbers in the
- * same order per cell. What differs is the contact physics itself (Rapier's solver) and a few
- * implementation choices listed in NOTES.md. Pure model: no browser or Node APIs.
+ * Each cell is a capsule on its own rigid body. Every step, Rapier resolves the contacts; then,
+ * on growth steps, cells grow, divide, leave the chamber or die, and cells near the side walls may
+ * attach to the surface with a spring (an "anchor"). Snapshots of all cells are recorded every
+ * snapshotInterval steps. Parameters and formulas: model.ts. Pure model: no browser or Node APIs,
+ * so the same code runs in run.ts (Node) and viewer.ts (browser).
+ *
+ * The model reproduces the original Box2D implementation step for step (same moments, same
+ * formulas, random numbers drawn in the same order per cell); docs/NOTES.md lists what differs.
+ *
+ *   const sim = await Simulation.create({ seed: 7 });
+ *   while (sim.stepCount < 3000) { sim.step(); }
+ *   sim.states.toPieces(); // the recorded snapshots as JSON
  */
 
-import RAPIER from "@dimforge/rapier2d-compat";
-import type { Collider, ColliderDesc, ImpulseJoint, RigidBody, World } from "@dimforge/rapier2d-compat";
+import RAPIER from "@dimforge/rapier2d-simd-compat";
+import type { Collider, ColliderDesc, ImpulseJoint, RigidBody, World } from "@dimforge/rapier2d-simd-compat";
 import {
   CHAMBER, COLOR_CENTRE, COLOR_INITIAL, COLOR_WALL, DEFAULT_PARAMS, Point, RGB,
-  Simulation, SimulationParams, cellMassProperties, checkParams, continuousDampingRate, dragFraction, orientationOf,
+  SimulationParams, cellMassProperties, checkParams, continuousDampingRate, dragFraction, orientationOf,
 } from "./model.js";
 import { Rng, mulberry32, randomSeed } from "./rng.js";
 import { CellState, StateRecorder } from "./states.js";
 
 let initialised: Promise<void> | null = null;
 
-/** Load Rapier's WebAssembly (once). Must finish before a RapierSimulation is created. */
+/** Load Rapier's WebAssembly (once). Simulation.create() does this for you. */
 export function initRapier(): Promise<void> {
   if (!initialised) { initialised = RAPIER.init(); }
   return initialised;
+}
+
+/** The Rapier version in use (results depend on it; see package.json). Call after initRapier(). */
+export function rapierVersion(): string {
+  return RAPIER.version();
 }
 
 interface Cell {
@@ -60,14 +73,17 @@ interface Anchor {
   damping: number;
 }
 
-/** Wall thickness. Walls are solid boxes rather than Box2D's zero-thickness edges (see NOTES.md). */
+/** Wall thickness. Walls are solid boxes rather than Box2D's zero-thickness edges (see docs/NOTES.md). */
 const WALL_THICKNESS = 2;
 
-export class RapierSimulation implements Simulation {
-  public readonly engine = "rapier";
+export class Simulation {
+  /** The parameters of this run: DEFAULT_PARAMS with the overrides applied, and the seed. */
   public readonly params: SimulationParams;
+  /** The Rapier world (rebuilt every rebuildInterval steps, so don't keep a reference to it). */
   public world: World;
+  /** The recorded snapshots and lineage, ready to save. */
   public readonly states: StateRecorder = new StateRecorder();
+  /** Number of simulation steps taken so far. */
   public stepCount: number = 0;
 
   private readonly rng: Rng;
@@ -76,13 +92,17 @@ export class RapierSimulation implements Simulation {
   private anchors: Anchor[] = [];
   private readonly zero = { x: 0, y: 0 };
 
+  /** Load Rapier (once) and create a simulation. Parameters not given take their DEFAULT_PARAMS value; no seed = random. */
+  public static async create(overrides: Partial<SimulationParams> = {}): Promise<Simulation> {
+    await initRapier();
+    return new Simulation(overrides);
+  }
+
+  /** Use Simulation.create(), or call initRapier() first. */
   constructor(overrides: Partial<SimulationParams> = {}) {
     this.params = { ...DEFAULT_PARAMS, seed: randomSeed(), ...overrides };
     const p = this.params;
     checkParams(p);
-    if (!Number.isInteger(p.rapierSubsteps) || p.rapierSubsteps < 1) {
-      throw new Error(`rapierSubsteps must be a positive integer (got ${p.rapierSubsteps})`);
-    }
     this.rng = mulberry32(p.seed);
     this.world = this.createWorld();
 
@@ -96,18 +116,63 @@ export class RapierSimulation implements Simulation {
     this.createWalls();
   }
 
+  // ---------------------------------------------------------------- public API
+
+  /** Number of bacteria currently in the chamber. */
   public get cellCount(): number {
     return this.cells.length;
   }
 
+  /** Each cell's centre, angle, end-cap centre distance, colour and id, at full precision. */
+  public forEachCell(fn: (x: number, y: number, angle: number, length: number, color: RGB, id: number) => void): void {
+    for (const cell of this.cells) {
+      const t = cell.body.translation();
+      fn(t.x, t.y, cell.body.rotation(), cell.length, cell.color, cell.id);
+    }
+  }
+
+  /** For drawing: each anchor point, with the centre of the cell it holds (null if that cell divided or left). */
+  public forEachAnchor(fn: (x: number, y: number, cell: Point | null) => void): void {
+    for (const anchor of this.anchors) {
+      fn(anchor.x, anchor.y, anchor.cell ? anchor.cell.body.translation() : null);
+    }
+  }
+
+  /** Advance one simulation step (1 / hertz). Returns true if a snapshot was taken. */
+  public step(): boolean {
+    const p = this.params;
+    for (let i = 0; i < p.substeps; i++) { this.world.step(); }
+    this.stepCount += 1;
+    const offset = this.stepCount % p.growthInterval;
+    const spacing = p.growthInterval / p.growthGroups;
+
+    // The group of cells whose turn it is to grow (all cells with growthGroups = 1)
+    if (offset % spacing === 0 && this.growDivideAndMark(offset / spacing)) { this.removeMarkedCells(); }
+
+    // Anchors are checked once per growth cycle
+    if (offset === 0) { this.removeAnchors(); }
+
+    if (p.refreshContacts === 1 && p.rebuildInterval > 0 && this.stepCount % p.rebuildInterval === 0) {
+      this.rebuildWorld();
+    }
+
+    if (this.stepCount % p.snapshotInterval === 0) {
+      this.takeSnapshot();
+      return true;
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------- Rapier world
+
   private createWorld(): World {
     const p = this.params;
     const world = new RAPIER.World({ x: 0, y: 0 });
-    world.timestep = 1 / (p.hertz * p.rapierSubsteps);
-    world.numSolverIterations = p.rapierSolverIterations;
-    world.numInternalPgsIterations = p.rapierPgsIterations;
-    if (p.rapierContactFrequency > 0) {
-      world.integrationParameters.contact_natural_frequency = p.rapierContactFrequency;
+    world.timestep = 1 / (p.hertz * p.substeps);
+    world.numSolverIterations = p.solverIterations;
+    world.numInternalPgsIterations = p.pgsIterations;
+    if (p.contactFrequency > 0) {
+      world.integrationParameters.contact_natural_frequency = p.contactFrequency;
     }
     return world;
   }
@@ -115,7 +180,7 @@ export class RapierSimulation implements Simulation {
   /**
    * Move everything into a fresh Rapier world and free the old one: same walls, and every cell
    * and anchor with its exact position, angle, velocities, mass, collider and spring. Used every
-   * rapierRebuildInterval steps to give back the memory Rapier 0.21 leaks when colliders are
+   * rebuildInterval steps to give back the memory Rapier 0.21 leaks when colliders are
    * replaced (see resizeCollider). Contact caches start fresh, as after any collider replacement.
    */
   private rebuildWorld(): void {
@@ -147,29 +212,7 @@ export class RapierSimulation implements Simulation {
     old.free();
   }
 
-  public step(): boolean {
-    const p = this.params;
-    for (let i = 0; i < p.rapierSubsteps; i++) { this.world.step(); }
-    this.stepCount += 1;
-    const offset = this.stepCount % p.growthInterval;
-    const spacing = p.growthInterval / p.growthGroups;
-
-    // The group of cells whose turn it is to grow (all cells with growthGroups = 1)
-    if (offset % spacing === 0 && this.growDivideAndMark(offset / spacing)) { this.removeMarkedCells(); }
-
-    // Anchors are checked once per growth cycle
-    if (offset === 0) { this.removeAnchors(); }
-
-    if (p.rapierRefreshContacts === 1 && p.rapierRebuildInterval > 0 && this.stepCount % p.rapierRebuildInterval === 0) {
-      this.rebuildWorld();
-    }
-
-    if (this.stepCount % p.snapshotInterval === 0) {
-      this.takeSnapshot();
-      return true;
-    }
-    return false;
-  }
+  // ---------------------------------------------------------------- the model, step by step
 
   /** Remove cells marked for removal (left the chamber, or died); divided cells were reused. */
   private removeMarkedCells(): void {
@@ -221,18 +264,6 @@ export class RapierSimulation implements Simulation {
     return Math.hypot(t.x - anchor.x, t.y - anchor.y) > max;
   }
 
-  public forEachCell(fn: (x: number, y: number, angle: number, length: number, color: RGB, id: number) => void): void {
-    for (const cell of this.cells) {
-      const t = cell.body.translation();
-      fn(t.x, t.y, cell.body.rotation(), cell.length, cell.color, cell.id);
-    }
-  }
-
-  public forEachAnchor(fn: (x: number, y: number, cell: Point | null) => void): void {
-    for (const anchor of this.anchors) {
-      fn(anchor.x, anchor.y, anchor.cell ? anchor.cell.body.translation() : null);
-    }
-  }
 
   /**
    * Grow, divide and mark for removal the cells of growth group `phase`.
@@ -364,10 +395,10 @@ export class RapierSimulation implements Simulation {
    * Rapier (0.21) keeps a contact's points from step to step as long as the two colliders hardly
    * move relative to each other, and does not recompute them when a collider's shape changes
    * (setHalfHeight / setShape). A cell at rest, e.g. in a packed colony, then grows straight into
-   * its neighbours and the walls with the contact still reporting zero depth. rapierRefreshContacts:
+   * its neighbours and the walls with the contact still reporting zero depth. refreshContacts:
    *  - 1 (default): replace the collider, which gives the cell fresh contacts. Rapier leaks some
    *    WebAssembly memory per replaced collider that touches others (the 4 GB heap ran out after
-   *    ~230 000 steps), so the whole world is rebuilt every rapierRebuildInterval steps, which
+   *    ~230 000 steps), so the whole world is rebuilt every rebuildInterval steps, which
    *    returns that memory.
    *  - 2: resize in place, then turn the collider by π on its body: the same capsule in the world,
    *    no allocation, and most contacts are recomputed, but some between two cells that both turned
@@ -375,7 +406,7 @@ export class RapierSimulation implements Simulation {
    *  - 0: resize in place only (stale contacts; to show the effect).
    */
   private resizeCollider(cell: Cell): void {
-    switch (this.params.rapierRefreshContacts) {
+    switch (this.params.refreshContacts) {
       case 1:
         this.world.removeCollider(cell.collider, false);
         cell.collider = this.world.createCollider(this.cellColliderDesc(cell.length, cell.sqrtFriction), cell.body);

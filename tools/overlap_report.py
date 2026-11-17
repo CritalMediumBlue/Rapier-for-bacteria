@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarise overlap logs written by `run.js --overlap-log FILE` as Markdown.
 
-usage: python3 bacteria/tools/overlap_report.py LOG.csv [LOG2.csv ...]
+usage: python3 tools/overlap_report.py LOG.csv [LOG2.csv ...]
            [--warmup STEPS] [--target FRACTION] [--width CELL_WIDTH] [--every N]
 
 For each log: a summary after the warm-up (worst and typical penetration, how many snapshots and
@@ -81,7 +81,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+")
     ap.add_argument("--warmup", type=int, default=3000, help="steps excluded from the target (default 3000)")
-    ap.add_argument("--target", type=float, default=0.05, help="max depth / cell width (default 0.05)")
+    ap.add_argument("--target", type=float, default=0.08, help="max depth / cell width (default 0.08, as in src/overlap.ts)")
     ap.add_argument("--width", type=float, default=0.8, help="cell width = 2 * radius (default 0.8)")
     ap.add_argument("--every", type=int, default=100, help="time series: every N-th snapshot (default 100)")
     args = ap.parse_args()

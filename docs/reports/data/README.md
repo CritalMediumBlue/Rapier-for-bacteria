@@ -5,7 +5,7 @@ cells, overlapping pairs, max / mean / 99th-percentile cell-cell penetration dep
 the target at the time of the run (5% of the cell width = 0.04; 8% = 0.064 for the final-defaults
 log of the 600 000-step run), max cell-wall depth, max depth as a fraction of the
 width, and the locations of the deepest pair and the deepest wall contact. Summarise with
-`python3 ../../tools/overlap_report.py FILE`, plot with `../../tools/overlap_chart.py`.
+`python3 tools/overlap_report.py FILE`, plot with `tools/overlap_chart.py` (from the repository root).
 
 | File | Engine and settings | Seed, steps |
 |---|---|---|
@@ -16,7 +16,7 @@ width, and the locations of the deepest pair and the deepest wall contact. Summa
 | `overlap-rapier-anchorhold-seed{7,11,23}-120k.csv` | as the morning's defaults, but anchors never let go (`anchorMaxStretch=0`, the testbed's behaviour; the default until 14 November) | 7 / 11 / 23, 120 000 |
 | `overlap-rapier-anchorhold-seed7-600k.csv` | as above, the overnight long run | 7, 600 000 |
 | `overlap-rapier-replace-norebuild-seed*-120k.csv` | anchors never let go, and no world rebuilds (leaks memory; a run this way aborted at step ~231 500) | 7 / 11 / 23, 120 000 |
-| `overlap-rapier-flip-seed*-120k.csv` | anchors never let go, and contacts refreshed by turning colliders by π (`rapierRefreshContacts=2`) | 7 / 11 / 23, 120 000 |
+| `overlap-rapier-flip-seed*-120k.csv` | anchors never let go, and contacts refreshed by turning colliders by π (`refreshContacts=2`) | 7 / 11 / 23, 120 000 |
 | `overlap-rapier-i12-f480-seed*-120k.csv` | 12 iterations, 480 Hz (no rebuilds; anchors never let go, as in all rows below) | 7 / 11 / 23, 120 000 |
 | `overlap-rapier-i8-f480-seed*-120k.csv` | 8 iterations, 480 Hz (no rebuilds) | 7 / 11 / 23, 120 000 |
 | `overlap-box2d-seed7-30k.csv` | Box2D, centred division, drag clamp, 0.8x cells, anchors never let go | 7, 30 000 |
