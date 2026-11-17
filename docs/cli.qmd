@@ -1,0 +1,382 @@
+---
+title: "The command-line runner"
+subtitle: "`src/run.ts`: long runs without a browser"
+---
+
+Long runs belong on the command line: 600 000 steps take about an hour on one core, and several
+runs with different seeds can go in parallel, one per core. The runner creates a simulation, steps
+it, and writes the recorded states to disk. Optionally it measures overlaps at every snapshot and
+logs the time per step.
+
+```sh
+node build/run.js --steps 600000 --seed 7 --out output/states.json
+node build/run.js --steps 30000 --set rate=0.002 --set anchorMaxStretch=1
+node build/run.js --steps 60000 --overlap-log output/overlap.csv --overlap-check
+```
+
+It is careful about two things. A run can take hours, so it never loses the work done so far:
+the file is saved regularly, always completely, and also when the run is interrupted or the physics
+engine fails. And it fails early: a mistyped option or an unwritable output path is reported
+before the first step, not after the last.
+
+```{.typescript file=src/run.ts}
+<<cli-imports>>
+
+<<cli-usage>>
+
+<<cli-fail>>
+
+<<cli-parse-args>>
+
+<<cli-save>>
+
+<<cli-format-duration>>
+
+<<cli-main>>
+
+void main();
+```
+
+```{.typescript #cli-imports}
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { DEFAULT_PARAMS, SimulationParams } from "./model.js";
+import {
+  OVERLAP_CSV_HEADER, OVERLAP_TARGET_FRACTION, OVERLAP_WARMUP_STEPS, OverlapMeter, OverlapStats, overlapCsvRow,
+} from "./overlap.js";
+import { Simulation, rapierVersion } from "./simulation.js";
+```
+
+## Options
+
+The help text documents every option. Progress goes to standard error, so standard output stays
+free for `--list-params`.
+
+```{.typescript #cli-usage}
+const USAGE = `Usage: node build/run.js --steps N [options]
+
+Options:
+  --steps N         number of simulation steps to run (required)
+  --out FILE        output file (default: states.json)
+  --seed N          random seed (default: random; printed at start)
+  --save-every N    also save after every N snapshots (default: 500; 0 = only at the end)
+  --set KEY=VALUE   override a simulation parameter (repeatable), e.g. --set rate=0.002
+  --list-params     print all parameters with their defaults and exit
+  --help            show this help
+
+Overlap check (cell-cell penetration depth, measured at every snapshot):
+  --overlap-log FILE         write one CSV row per snapshot (max/mean/p99 depth, ...)
+  --overlap-warmup N         steps to let the random initial placement relax before the
+                             target applies (default: ${OVERLAP_WARMUP_STEPS})
+  --overlap-target F         target: max depth < F * cell width (default: ${OVERLAP_TARGET_FRACTION})
+  --overlap-check            exit with status 3 if the target is missed after the warm-up
+
+Performance:
+  --timing-log FILE          write one CSV row per snapshot: step, cells, ms per step since the last snapshot
+
+The file is rewritten in full at each save, so it is always a complete, valid JSON file.
+Parameters, seed and progress are printed to stderr.`;
+```
+
+Any mistake ends the program with the message and the help text, and exit status 1:
+
+```{.typescript #cli-fail}
+function fail(message: string): never {
+  console.error(`Error: ${message}\n\n${USAGE}`);
+  process.exit(1);
+}
+```
+
+`parseArgs` walks the arguments once. Two small helpers read an option's value and check that it
+is a non-negative integer. `--set` accepts any parameter of [the model](model.qmd#parameters) by
+name, checked against `DEFAULT_PARAMS`, so new parameters need no change here. `--list-params` and
+`--help` print and exit at once.
+
+```{.typescript #cli-parse-args}
+function parseArgs(argv: string[]) {
+  const opts = {
+    steps: NaN, out: "states.json", saveEvery: 500,
+    overrides: {} as Partial<SimulationParams>,
+    overlapLog: null as string | null, overlapWarmup: OVERLAP_WARMUP_STEPS, overlapTarget: OVERLAP_TARGET_FRACTION,
+    overlapCheck: false, timingLog: null as string | null,
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    const value = (): string => {
+      if (i + 1 >= argv.length) { fail(`${arg} needs a value`); }
+      return argv[++i];
+    };
+    const int = (s: string): number => {
+      const n = Number(s);
+      if (!Number.isInteger(n) || n < 0) { fail(`${arg} expects a non-negative integer, got "${s}"`); }
+      return n;
+    };
+    switch (arg) {
+      case "--steps": opts.steps = int(value()); break;
+      case "--out": opts.out = value(); break;
+      case "--seed": opts.overrides.seed = int(value()); break;
+      case "--save-every": opts.saveEvery = int(value()); break;
+      case "--set": {
+        const [key, raw] = value().split("=");
+        if (!(key in DEFAULT_PARAMS)) { fail(`unknown parameter "${key}" (see --list-params)`); }
+        const num = Number(raw);
+        if (raw === undefined || raw === "" || Number.isNaN(num)) { fail(`--set ${key} needs a numeric value`); }
+        (opts.overrides as Record<string, number>)[key] = num;
+        break;
+      }
+      case "--overlap-log": opts.overlapLog = value(); break;
+      case "--overlap-warmup": opts.overlapWarmup = int(value()); break;
+      case "--overlap-target": {
+        const raw = value();
+        opts.overlapTarget = Number(raw);
+        if (!(opts.overlapTarget > 0)) { fail(`--overlap-target expects a positive number, got "${raw}"`); }
+        break;
+      }
+      case "--overlap-check": opts.overlapCheck = true; break;
+      case "--timing-log": opts.timingLog = value(); break;
+      case "--list-params":
+        for (const [k, v] of Object.entries(DEFAULT_PARAMS)) { console.log(`${k}=${v}`); }
+        process.exit(0);
+      case "--help": case "-h":
+        console.log(USAGE);
+        process.exit(0);
+      default:
+        fail(`unknown option "${arg}"`);
+    }
+  }
+  if (Number.isNaN(opts.steps)) { fail("--steps is required"); }
+  if (opts.overlapCheck && !opts.overlapLog) { fail("--overlap-check needs --overlap-log"); }
+  return opts;
+}
+```
+
+## Saving
+
+The states file is written piece by piece (see [Writing the file](recording.qmd#writing-the-file))
+to a temporary file, which then replaces the real one. Renaming is atomic, so even if the program is
+killed while saving, the states file on disk is always the previous complete version or the new
+complete version, never half of one.
+
+```{.typescript #cli-save}
+function save(sim: Simulation, out: string): void {
+  const tmp = `${out}.tmp`;
+  const fd = fs.openSync(tmp, "w");
+  try {
+    for (const piece of sim.states.toPieces()) { fs.writeSync(fd, piece); }
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.renameSync(tmp, out);
+  const mb = fs.statSync(out).size / 1e6;
+  console.error(`  saved ${sim.states.snapshotCount} snapshots, ${sim.states.idCount} ids -> ${out} (${mb.toFixed(1)} MB)`);
+}
+```
+
+A short duration format for the progress reports, such as `1h38m` or `4m05s`:
+
+```{.typescript #cli-format-duration}
+function formatDuration(seconds: number): string {
+  const h = Math.floor(seconds / 3600), m = Math.floor((seconds % 3600) / 60), s = Math.floor(seconds % 60);
+  return h > 0 ? `${h}h${String(m).padStart(2, "0")}m` : m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+```
+
+## The run
+
+```{.typescript #cli-main}
+async function main(): Promise<void> {
+  <<cli-prepare>>
+
+  <<cli-overlap-setup>>
+
+  <<cli-timing-setup>>
+
+  <<cli-loop>>
+
+  <<cli-finish>>
+}
+```
+
+### Before the first step
+
+The output folders are created, and the states file is tested for writing by creating and deleting
+its temporary file, so that a bad path fails now rather than at the first save, possibly hours
+later. Then the simulation is created; invalid parameters stop the run here too. The first line of
+output records the Rapier version, the seed and the run's length, and any parameters that were
+changed, which is everything needed to repeat the run.
+
+```{.typescript #cli-prepare}
+const opts = parseArgs(process.argv.slice(2));
+const out = path.resolve(opts.out);
+try {
+  for (const file of [out, opts.overlapLog, opts.timingLog]) {
+    if (file) { fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true }); }
+  }
+  fs.closeSync(fs.openSync(`${out}.tmp`, "w"));
+  fs.unlinkSync(`${out}.tmp`);
+} catch (e) {
+  fail(`cannot write ${out}: ${e instanceof Error ? e.message : String(e)}`);
+}
+let sim: Simulation;
+try {
+  sim = await Simulation.create(opts.overrides);
+} catch (e) {
+  fail(e instanceof Error ? e.message : String(e));
+}
+
+console.error(`Rapier ${rapierVersion()}, seed ${sim.params.seed}, ${opts.steps} steps, snapshot every ${sim.params.snapshotInterval} steps -> ${out}`);
+const changed = Object.entries(opts.overrides).filter(([k]) => k !== "seed");
+if (changed.length > 0) { console.error(`overrides: ${changed.map(([k, v]) => `${k}=${v}`).join(", ")}`); }
+```
+
+With `--overlap-log`, the [overlap meter](overlap.qmd) runs at every snapshot. The runner keeps the
+latest measurement for the progress reports and, after the warm-up, counts the snapshots and those
+over the target, sums the mean depths, and remembers the worst snapshot.
+
+```{.typescript #cli-overlap-setup}
+const width = 2 * sim.params.radius;
+const targetDepth = opts.overlapTarget * width;
+const meter = new OverlapMeter();
+let overlapFd: number | null = null;
+let last: OverlapStats | null = null;
+let worst: OverlapStats | null = null;
+let snapshotsChecked = 0, snapshotsOverTarget = 0, meanSum = 0;
+if (opts.overlapLog) {
+  overlapFd = fs.openSync(path.resolve(opts.overlapLog), "w");
+  fs.writeSync(overlapFd, OVERLAP_CSV_HEADER + "\n");
+  console.error(`overlap: logging to ${path.resolve(opts.overlapLog)}; target max depth < ${opts.overlapTarget} x width ` +
+    `= ${targetDepth.toFixed(3)} after step ${opts.overlapWarmup}`);
+}
+```
+
+With `--timing-log`, the time spent in `sim.step()` is summed between snapshots. Only the physics
+is timed: saving and the overlap measurement are excluded.
+
+```{.typescript #cli-timing-setup}
+let timingFd: number | null = null;
+let stepMs = 0, stepsTimed = 0;
+if (opts.timingLog) {
+  timingFd = fs.openSync(path.resolve(opts.timingLog), "w");
+  fs.writeSync(timingFd, "step,cells,ms_per_step\n");
+}
+```
+
+### The loop
+
+Ctrl+C does not kill the run: it sets a flag, and the loop stops after the current step and saves.
+
+```{.typescript #cli-loop}
+let interrupted = false;
+process.on("SIGINT", () => { interrupted = true; });
+
+const start = Date.now();
+let lastReport = start;
+let savedAtSnapshot = -1;
+for (let i = 0; i < opts.steps && !interrupted; i++) {
+  <<cli-step>>
+  <<cli-log-timing>>
+  <<cli-log-overlap>>
+  <<cli-periodic-save>>
+  <<cli-progress>>
+}
+```
+
+Each step is timed. If the physics engine throws (a WebAssembly trap, for instance, when its memory
+runs out), the snapshots recorded so far are saved before the program exits with status 4.
+
+```{.typescript #cli-step}
+const t0 = performance.now();
+let snapshotTaken: boolean;
+try {
+  snapshotTaken = sim.step();
+} catch (e) {
+  console.error(`ERROR: the simulation failed at step ${sim.stepCount + 1}:`, e);
+  console.error(`saving the ${sim.states.snapshotCount} snapshots recorded so far...`);
+  save(sim, out);
+  if (overlapFd !== null) { fs.closeSync(overlapFd); }
+  if (timingFd !== null) { fs.closeSync(timingFd); }
+  process.exit(4);
+}
+stepMs += performance.now() - t0;
+stepsTimed++;
+```
+
+At each snapshot: the mean time per step since the last snapshot,
+
+```{.typescript #cli-log-timing}
+if (snapshotTaken && timingFd !== null) {
+  fs.writeSync(timingFd, `${sim.stepCount},${sim.cellCount},${(stepMs / stepsTimed).toFixed(4)}\n`);
+  stepMs = 0;
+  stepsTimed = 0;
+}
+```
+
+the overlap measurement and, after the warm-up, its statistics,
+
+```{.typescript #cli-log-overlap}
+if (snapshotTaken && overlapFd !== null) {
+  last = meter.measure(sim, sim.params.radius, targetDepth);
+  fs.writeSync(overlapFd, overlapCsvRow(last, width) + "\n");
+  if (sim.stepCount >= opts.overlapWarmup) {
+    snapshotsChecked++;
+    meanSum += last.meanDepth;
+    if (last.maxDepth >= targetDepth) { snapshotsOverTarget++; }
+    if (!worst || last.maxDepth > worst.maxDepth) { worst = last; }
+  }
+}
+```
+
+and, every `--save-every` snapshots, a save:
+
+```{.typescript #cli-periodic-save}
+if (snapshotTaken && opts.saveEvery > 0 && sim.states.snapshotCount % opts.saveEvery === 0) {
+  save(sim, out);
+  savedAtSnapshot = sim.states.snapshotCount;
+}
+```
+
+Every ten seconds of wall-clock time, a progress line reports the step, the cell and snapshot
+counts, the speed, the estimated time to completion and the latest overlap:
+
+```{.typescript #cli-progress}
+const now = Date.now();
+if (now - lastReport >= 10000) {
+  lastReport = now;
+  const elapsed = (now - start) / 1000;
+  const rate = sim.stepCount / elapsed;
+  const eta = (opts.steps - sim.stepCount) / rate;
+  const overlap = last ? `, overlap max ${(last.maxDepth / width * 100).toFixed(1)}% / mean ${(last.meanDepth / width * 100).toFixed(2)}% of width` : "";
+  console.error(`step ${sim.stepCount}/${opts.steps} (${(100 * sim.stepCount / opts.steps).toFixed(1)}%), ` +
+    `${sim.cellCount} cells, ${sim.states.snapshotCount} snapshots, ${rate.toFixed(0)} steps/s, ETA ${formatDuration(eta)}${overlap}`);
+}
+```
+
+### After the last step
+
+The final save is skipped if nothing was recorded since the last one. With an overlap log, the run
+ends with a verdict: the worst snapshot after the warm-up, the average mean depth, and how many
+snapshots exceeded the target. With `--overlap-check`, a missed target sets exit status 3, so that
+scripts can tell a run that finished from a run that also passed.
+
+```{.typescript #cli-finish}
+if (interrupted) { console.error(`interrupted at step ${sim.stepCount}; saving...`); }
+if (sim.states.snapshotCount !== savedAtSnapshot) { save(sim, out); }
+const seconds = (Date.now() - start) / 1000;
+console.error(`done in ${formatDuration(seconds)}, ${(sim.stepCount / seconds).toFixed(0)} steps/s average, ` +
+  `${sim.cellCount} cells at the end (seed ${sim.params.seed})`);
+
+if (timingFd !== null) { fs.closeSync(timingFd); }
+if (overlapFd !== null) {
+  fs.closeSync(overlapFd);
+  const pct = (d: number) => `${(d / width * 100).toFixed(2)}% of width (${d.toFixed(4)})`;
+  if (snapshotsChecked === 0) {
+    console.error(`overlap: no snapshots after the warm-up (step ${opts.overlapWarmup})`);
+  } else {
+    const passed = snapshotsOverTarget === 0;
+    console.error(`overlap after step ${opts.overlapWarmup}: ${snapshotsChecked} snapshots, worst max depth ${pct(worst!.maxDepth)} ` +
+      `at step ${worst!.step}, average mean depth ${pct(meanSum / snapshotsChecked)}, ` +
+      `${snapshotsOverTarget} snapshots over target -> ${passed ? "PASS" : "FAIL"}`);
+    if (!passed && opts.overlapCheck) { process.exitCode = 3; }
+  }
+}
+```

@@ -1,20 +1,3 @@
-/**
- * The microfluidic biofilm simulation on the Rapier physics engine (2D, WebAssembly).
- *
- * Each cell is a capsule on its own rigid body. Every step, Rapier resolves the contacts; then,
- * on growth steps, cells grow, divide, leave the chamber or die, and cells near the side walls may
- * attach to the surface with a spring (an "anchor"). Snapshots of all cells are recorded every
- * snapshotInterval steps. Parameters and formulas: model.ts. Pure model: no browser or Node APIs,
- * so the same code runs in run.ts (Node) and viewer.ts (browser).
- *
- * The model reproduces the original Box2D implementation step for step (same moments, same
- * formulas, random numbers drawn in the same order per cell); docs/NOTES.md lists what differs.
- *
- *   const sim = await Simulation.create({ seed: 7 });
- *   while (sim.stepCount < 3000) { sim.step(); }
- *   sim.states.toPieces(); // the recorded snapshots as JSON
- */
-
 import RAPIER from "@dimforge/rapier2d-simd-compat";
 import type { Collider, ColliderDesc, ImpulseJoint, RigidBody, World } from "@dimforge/rapier2d-simd-compat";
 import {
@@ -26,13 +9,11 @@ import { CellState, StateRecorder } from "./states.js";
 
 let initialised: Promise<void> | null = null;
 
-/** Load Rapier's WebAssembly (once). Simulation.create() does this for you. */
 export function initRapier(): Promise<void> {
   if (!initialised) { initialised = RAPIER.init(); }
   return initialised;
 }
 
-/** The Rapier version in use (results depend on it; see package.json). Call after initRapier(). */
 export function rapierVersion(): string {
   return RAPIER.version();
 }
@@ -41,21 +22,15 @@ interface Cell {
   id: number;
   body: RigidBody;
   collider: Collider;
-  /** sqrt of the cell's friction coefficient (see createCell). */
   sqrtFriction: number;
-  /** Whether the collider is currently turned by π on its body (see resizeCollider). */
   flipped: boolean;
-  /** Mass and rotational inertia, fixed at birth. */
   mass: number;
   inertia: number;
-  /** Distance between the end-cap centres (the exported `le`). */
   length: number;
   growthRate: number;
-  /** Growth group (see growthGroups); inherited by daughters. */
   phase: number;
   reproductiveLength: number;
   color: RGB;
-  /** Anchor springs currently holding this cell. */
   anchors: Anchor[];
   removed: boolean;
 }
@@ -65,25 +40,18 @@ interface Anchor {
   x: number;
   y: number;
   createdAtStep: number;
-  /** The cell it holds and the spring, until that cell divides or is removed. */
   cell: Cell | null;
   joint: ImpulseJoint | null;
-  /** Spring constants (kept to recreate the spring when the world is rebuilt). */
   stiffness: number;
   damping: number;
 }
 
-/** Wall thickness. Walls are solid boxes rather than Box2D's zero-thickness edges (see docs/NOTES.md). */
 const WALL_THICKNESS = 2;
 
 export class Simulation {
-  /** The parameters of this run: DEFAULT_PARAMS with the overrides applied, and the seed. */
   public readonly params: SimulationParams;
-  /** The Rapier world (rebuilt every rebuildInterval steps, so don't keep a reference to it). */
   public world: World;
-  /** The recorded snapshots and lineage, ready to save. */
   public readonly states: StateRecorder = new StateRecorder();
-  /** Number of simulation steps taken so far. */
   public stepCount: number = 0;
 
   private readonly rng: Rng;
@@ -92,13 +60,11 @@ export class Simulation {
   private anchors: Anchor[] = [];
   private readonly zero = { x: 0, y: 0 };
 
-  /** Load Rapier (once) and create a simulation. Parameters not given take their DEFAULT_PARAMS value; no seed = random. */
   public static async create(overrides: Partial<SimulationParams> = {}): Promise<Simulation> {
     await initRapier();
     return new Simulation(overrides);
   }
 
-  /** Use Simulation.create(), or call initRapier() first. */
   constructor(overrides: Partial<SimulationParams> = {}) {
     this.params = { ...DEFAULT_PARAMS, seed: randomSeed(), ...overrides };
     const p = this.params;
@@ -116,14 +82,10 @@ export class Simulation {
     this.createWalls();
   }
 
-  // ---------------------------------------------------------------- public API
-
-  /** Number of bacteria currently in the chamber. */
   public get cellCount(): number {
     return this.cells.length;
   }
 
-  /** Each cell's centre, angle, end-cap centre distance, colour and id, at full precision. */
   public forEachCell(fn: (x: number, y: number, angle: number, length: number, color: RGB, id: number) => void): void {
     for (const cell of this.cells) {
       const t = cell.body.translation();
@@ -131,14 +93,12 @@ export class Simulation {
     }
   }
 
-  /** For drawing: each anchor point, with the centre of the cell it holds (null if that cell divided or left). */
   public forEachAnchor(fn: (x: number, y: number, cell: Point | null) => void): void {
     for (const anchor of this.anchors) {
       fn(anchor.x, anchor.y, anchor.cell ? anchor.cell.body.translation() : null);
     }
   }
 
-  /** Advance one simulation step (1 / hertz). Returns true if a snapshot was taken. */
   public step(): boolean {
     const p = this.params;
     for (let i = 0; i < p.substeps; i++) { this.world.step(); }
@@ -146,10 +106,8 @@ export class Simulation {
     const offset = this.stepCount % p.growthInterval;
     const spacing = p.growthInterval / p.growthGroups;
 
-    // The group of cells whose turn it is to grow (all cells with growthGroups = 1)
     if (offset % spacing === 0 && this.growDivideAndMark(offset / spacing)) { this.removeMarkedCells(); }
 
-    // Anchors are checked once per growth cycle
     if (offset === 0) { this.removeAnchors(); }
 
     if (p.refreshContacts === 1 && p.rebuildInterval > 0 && this.stepCount % p.rebuildInterval === 0) {
@@ -163,8 +121,6 @@ export class Simulation {
     return false;
   }
 
-  // ---------------------------------------------------------------- Rapier world
-
   private createWorld(): World {
     const p = this.params;
     const world = new RAPIER.World({ x: 0, y: 0 });
@@ -177,12 +133,6 @@ export class Simulation {
     return world;
   }
 
-  /**
-   * Move everything into a fresh Rapier world and free the old one: same walls, and every cell
-   * and anchor with its exact position, angle, velocities, mass, collider and spring. Used every
-   * rebuildInterval steps to give back the memory Rapier 0.21 leaks when colliders are
-   * replaced (see resizeCollider). Contact caches start fresh, as after any collider replacement.
-   */
   private rebuildWorld(): void {
     const old = this.world;
     this.world = this.createWorld();
@@ -212,14 +162,11 @@ export class Simulation {
     old.free();
   }
 
-  // ---------------------------------------------------------------- the model, step by step
-
-  /** Remove cells marked for removal (left the chamber, or died); divided cells were reused. */
   private removeMarkedCells(): void {
     let kept = 0;
     for (const cell of this.cells) {
       if (cell.removed) {
-        this.detachAnchors(cell, false); // removing the body removes its springs
+        this.detachAnchors(cell, false);
         this.world.removeRigidBody(cell.body);
       } else {
         this.cells[kept++] = cell;
@@ -228,10 +175,6 @@ export class Simulation {
     this.cells.length = kept;
   }
 
-  /**
-   * Remove expired anchors, and with anchorMaxStretch those pulled too far (removing the anchor
-   * body also removes its spring).
-   */
   private removeAnchors(): void {
     const p = this.params;
     let kept = 0;
@@ -246,7 +189,6 @@ export class Simulation {
     this.anchors.length = kept;
   }
 
-  /** Continuous drag as body damping (rate in 1/s; 0 with the testbed's drag kick). */
   private linearDamping(mass: number): number {
     const p = this.params;
     return p.continuousDrag !== 0 ? continuousDampingRate(p.airResistance, mass, p.growthInterval) : 0;
@@ -264,29 +206,21 @@ export class Simulation {
     return Math.hypot(t.x - anchor.x, t.y - anchor.y) > max;
   }
 
-
-  /**
-   * Grow, divide and mark for removal the cells of growth group `phase`.
-   * Returns whether any cell was marked for removal.
-   */
   private growDivideAndMark(phase: number): boolean {
     const p = this.params;
     const dt = 1 / p.hertz;
     const kick = p.continuousDrag === 0;
     let marked = false;
-    const count = this.cells.length; // daughters appended below are first visited on their next growth step
+    const count = this.cells.length;
     for (let i = 0; i < count; i++) {
       const cell = this.cells[i];
       if (cell.phase !== phase) { continue; }
       const body = cell.body;
 
-      // Grow along the long axis
       cell.length *= cell.growthRate;
       this.resizeCollider(cell);
 
       if (kick) {
-        // The testbed's drag kick. Box2D applied the force once per fixture (3x), and it acted
-        // during the next step; the same velocity change as an impulse here.
         const v = body.linvel();
         const linear = -dragFraction(p.airResistance, cell.mass, dt, p.dragClamp !== 0) * cell.mass;
         body.applyImpulse({ x: linear * v.x, y: linear * v.y }, true);
@@ -298,20 +232,17 @@ export class Simulation {
       const angle = body.rotation();
       let divided = false;
 
-      // Divide into two daughters along the long axis
       if (length >= cell.reproductiveLength) {
         const a = p.radius;
         const proportion = p.reproductionProportionMin + this.rng() * p.reproductionProportionRange;
         const lengthA = (length - (2 * a)) * proportion;
         const lengthB = (length - (2 * a)) * (1 - proportion);
-        // Distances of the daughters' centres from the parent's (see centredDivision in model.ts)
         const factorA = p.centredDivision ? length / 2 - lengthB / 2 : proportion * (1 / 2) * length + (a / 2);
         const factorB = p.centredDivision ? length / 2 - lengthA / 2 : (1 - proportion) * (1 / 2) * length + (a / 2);
         const sin = Math.sin(angle), cos = Math.cos(angle);
         const x1 = position.x + factorB * sin, y1 = position.y - factorB * cos;
         const x2 = position.x - factorA * sin, y2 = position.y + factorA * cos;
 
-        // Daughter 1 reuses the parent's body and collider (new id, fresh state); daughter 2 is new
         const color = cell.color;
         const parentId = cell.id;
         this.detachAnchors(cell, true);
@@ -320,21 +251,16 @@ export class Simulation {
         divided = true;
       }
 
-      // Leave the chamber, or die at random (draws the death number only when inside, as Box2D did)
       if (position.x < p.minX || position.x > p.maxX || position.y < p.minY || position.y > p.maxY || this.rng() < p.randomDeathProbability) {
-        // A divided parent no longer exists (its daughters stay, as in Box2D)
         if (!divided) { cell.removed = true; marked = true; }
       }
 
-      // Near the side walls: different growth rate, and a chance to attach to the surface
       if (position.x < p.minX + p.wallZone || position.x > p.maxX - p.wallZone) {
         if (!divided) {
           cell.color = COLOR_WALL;
           cell.growthRate = 1 + p.wallRate;
         }
         if (this.rng() < p.anchorProbability) {
-          // In Box2D a cell that divided in this same pass still got the anchor, whose spring then
-          // vanished with the parent: an anchor point holding nothing. Same here.
           this.createAnchor(position.x, position.y, divided || cell.removed ? null : cell);
         }
       } else if (!divided) {
@@ -354,7 +280,6 @@ export class Simulation {
     this.states.addSnapshot(cells);
   }
 
-  /** A new cell. Random numbers are drawn in Box2D's order: friction, then division length. */
   private createCell(x: number, y: number, angle: number, length: number, color: RGB, parentId: number, phase: number): Cell {
     const p = this.params;
     const friction = this.rng();
@@ -367,7 +292,6 @@ export class Simulation {
       .setLinearDamping(this.linearDamping(mass))
       .setAngularDamping(this.angularDamping(inertia))
       .setAdditionalMassProperties(mass, this.zero, inertia));
-    // Box2D mixes frictions as sqrt(f1 * f2): store sqrt(f) and multiply
     const sqrtFriction = Math.sqrt(friction);
     const collider = this.world.createCollider(this.cellColliderDesc(length, sqrtFriction), body);
     const id = this.nextId++;
@@ -380,7 +304,6 @@ export class Simulation {
 
   private cellColliderDesc(length: number, sqrtFriction: number): ColliderDesc {
     const p = this.params;
-    // Mass comes from the body (fixed at birth, as in Box2D), so the collider has no density
     return RAPIER.ColliderDesc.capsule(length / 2, p.radius)
       .setDensity(0)
       .setFriction(sqrtFriction)
@@ -389,22 +312,6 @@ export class Simulation {
       .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max);
   }
 
-  /**
-   * Give the cell's collider its current length.
-   *
-   * Rapier (0.21) keeps a contact's points from step to step as long as the two colliders hardly
-   * move relative to each other, and does not recompute them when a collider's shape changes
-   * (setHalfHeight / setShape). A cell at rest, e.g. in a packed colony, then grows straight into
-   * its neighbours and the walls with the contact still reporting zero depth. refreshContacts:
-   *  - 1 (default): replace the collider, which gives the cell fresh contacts. Rapier leaks some
-   *    WebAssembly memory per replaced collider that touches others (the 4 GB heap ran out after
-   *    ~230 000 steps), so the whole world is rebuilt every rebuildInterval steps, which
-   *    returns that memory.
-   *  - 2: resize in place, then turn the collider by π on its body: the same capsule in the world,
-   *    no allocation, and most contacts are recomputed, but some between two cells that both turned
-   *    are not (more overlap excursions; see NOTES.md).
-   *  - 0: resize in place only (stale contacts; to show the effect).
-   */
   private resizeCollider(cell: Cell): void {
     switch (this.params.refreshContacts) {
       case 1:
@@ -421,7 +328,6 @@ export class Simulation {
     }
   }
 
-  /** Turn an existing cell (a dividing parent) into a newborn one: same as createCell, reusing the body. */
   private resetCell(cell: Cell, x: number, y: number, angle: number, length: number, color: RGB, parentId: number): void {
     const p = this.params;
     const friction = this.rng();
@@ -442,20 +348,18 @@ export class Simulation {
     cell.length = length;
     cell.sqrtFriction = Math.sqrt(friction);
     cell.collider.setFriction(cell.sqrtFriction);
-    this.resizeCollider(cell); // new length (and friction), fresh contacts
+    this.resizeCollider(cell);
     cell.color = color;
     cell.growthRate = 1 + p.rate;
     cell.id = this.nextId++;
     this.states.addLineage(cell.id, parentId);
   }
 
-  /** Zero-length spring from the cell centre to a new fixed point (none if `cell` is null). */
   private createAnchor(x: number, y: number, cell: Cell | null): void {
     const p = this.params;
     const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x, y));
     const anchor: Anchor = { body, x, y, createdAtStep: this.stepCount, cell, joint: null, stiffness: 0, damping: 0 };
     if (cell) {
-      // Box2D's LinearStiffness for a cell held by a static body: stiffness m·ω², damping 2·m·ζ·ω
       const mass = cell.body.mass();
       const omega = 2 * Math.PI * p.anchorFrequencyHz;
       anchor.stiffness = mass * omega * omega;
@@ -467,7 +371,6 @@ export class Simulation {
     this.anchors.push(anchor);
   }
 
-  /** The cell's anchors stop holding it. `removeJoints`: false when the cell's body is about to be removed anyway. */
   private detachAnchors(cell: Cell, removeJoints: boolean): void {
     for (const anchor of cell.anchors) {
       if (removeJoints && anchor.joint) { this.world.removeImpulseJoint(anchor.joint, true); }
@@ -477,10 +380,6 @@ export class Simulation {
     cell.anchors.length = 0;
   }
 
-  /**
-   * Chamber walls as one fixed body. Side and top walls are solid boxes whose inner faces lie on
-   * Box2D's edges; the small triangles are the same as in Box2D.
-   */
   private createWalls(): void {
     const walls = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
     const add = (desc: ColliderDesc) => this.world.createCollider(desc
@@ -488,20 +387,17 @@ export class Simulation {
       .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Multiply)
       .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max), walls);
     for (const [v1, v2] of CHAMBER.edges) {
-      // Axis-aligned edges; the box extends away from the chamber centre
       const cx = (v1.x + v2.x) / 2, cy = (v1.y + v2.y) / 2;
       const hx = Math.abs(v1.x - v2.x) / 2, hy = Math.abs(v1.y - v2.y) / 2;
       const t = WALL_THICKNESS / 2;
       if (hx === 0) {
         add(RAPIER.ColliderDesc.cuboid(t, hy).setTranslation(cx + Math.sign(cx) * t, cy));
       } else {
-        add(RAPIER.ColliderDesc.cuboid(hx + 2 * t, t).setTranslation(cx, cy + t)); // top wall, covering the corners
+        add(RAPIER.ColliderDesc.cuboid(hx + 2 * t, t).setTranslation(cx, cy + t));
       }
     }
     for (const tri of CHAMBER.triangles) {
       const [a, b, c] = tri.vertices.map((v) => ({ x: v.x + tri.offset.x, y: v.y + tri.offset.y }));
-      // Rapier needs counter-clockwise triangles: a clockwise one lets cells pass through it (the
-      // left- and top-wall triangles are listed clockwise; Box2D reorders them itself)
       const clockwise = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y) < 0;
       add(clockwise ? RAPIER.ColliderDesc.triangle(a, c, b) : RAPIER.ColliderDesc.triangle(a, b, c));
     }

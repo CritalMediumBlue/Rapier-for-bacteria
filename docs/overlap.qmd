@@ -1,0 +1,372 @@
+---
+title: "Measuring overlaps"
+subtitle: "`src/overlap.ts`: how deep cells press into each other and into the walls"
+---
+
+Real bacteria do not pass through each other. In a physics engine, bodies pressed together always
+overlap a little, since the solver only pushes them apart after they touch. How deep they overlap
+is the best single measure of whether the solver is doing its job, so the program measures it:
+for every pair of touching cells, and for cells against the walls. The solver settings were tuned
+against this measure, and long runs are validated with it (see the
+[overlap report](reports/overlap-report.md)).
+
+The measurement runs on the live simulation, at full precision. The recorded files are rounded to
+two decimals (orientation to 0.01·π), which alone can move a cell's tip by about 0.03, more than the
+overlaps being measured.
+
+```{.typescript file=src/overlap.ts}
+<<overlap-imports>>
+
+<<overlap-target>>
+
+<<overlap-stats>>
+
+<<overlap-csv>>
+
+<<overlap-segment-distance>>
+
+<<overlap-clamp>>
+
+<<overlap-meter>>
+
+<<overlap-wall-segments>>
+
+<<overlap-percentile>>
+```
+
+```{.typescript #overlap-imports}
+import { CHAMBER } from "./model.js";
+import type { Simulation } from "./simulation.js";
+```
+
+## The target
+
+The deepest overlap between two cells should stay below 8% of the cell width. The target was 5%
+at first; it was relaxed to 8% in exchange for fewer solver iterations, i.e. faster steps. It
+applies after a warm-up of 3000 steps, since the random initial placement overlaps heavily and
+needs time to relax.
+
+```{.typescript #overlap-target}
+export const OVERLAP_TARGET_FRACTION = 0.08;
+export const OVERLAP_WARMUP_STEPS = 3000;
+```
+
+## The measurements
+
+| Field | Meaning |
+|---|---|
+| `step`, `cells` | when the measurement was taken, and how many cells there were |
+| `overlappingPairs` | pairs of cells that overlap at all |
+| `maxDepth` | the deepest cell–cell overlap |
+| `meanDepth` | the mean over the overlapping pairs (0 if there are none) |
+| `p99Depth` | the 99th percentile over the overlapping pairs |
+| `pairsOverTarget` | pairs deeper than the target |
+| `maxWallDepth` | the deepest overlap of a cell with a wall or wall triangle |
+| `maxAt`, `maxWallAt` | where the deepest overlaps are: the midpoint between the two cells' centres, and the centre of the cell in the wall |
+
+```{.typescript #overlap-stats}
+export interface OverlapStats {
+  step: number;
+  cells: number;
+  overlappingPairs: number;
+  maxDepth: number;
+  meanDepth: number;
+  p99Depth: number;
+  pairsOverTarget: number;
+  maxWallDepth: number;
+  maxAt: { x: number, y: number };
+  maxWallAt: { x: number, y: number };
+}
+```
+
+The [runner](cli.qmd) can log one row per snapshot as CSV, for the analysis scripts in `tools/`:
+
+```{.typescript #overlap-csv}
+export const OVERLAP_CSV_HEADER =
+  "step,cells,overlapping_pairs,max_depth,mean_depth,p99_depth,pairs_over_target,max_wall_depth,max_depth_fraction_of_width,max_x,max_y,wall_x,wall_y";
+
+export function overlapCsvRow(s: OverlapStats, width: number): string {
+  return [s.step, s.cells, s.overlappingPairs, s.maxDepth.toFixed(5), s.meanDepth.toFixed(5), s.p99Depth.toFixed(5),
+    s.pairsOverTarget, s.maxWallDepth.toFixed(5), (s.maxDepth / width).toFixed(5),
+    s.maxAt.x.toFixed(2), s.maxAt.y.toFixed(2), s.maxWallAt.x.toFixed(2), s.maxWallAt.y.toFixed(2)].join(",");
+}
+```
+
+## Capsules and segments
+
+A capsule is the set of points within distance $r$ of a line segment, its *axis*: here, the segment
+between the centres of the two end caps. Two capsules therefore overlap exactly when their axes are
+closer than $2r$, and the depth of the overlap is
+
+$$
+d = 2r - \operatorname{dist}(\text{axis}_1, \text{axis}_2) .
+$$
+
+Likewise a cell overlaps a wall (a segment of zero thickness) by $r - \operatorname{dist}$. So the
+whole measurement comes down to the distance between two segments.
+
+### Distance between two segments
+
+The function below is the classic algorithm from Christer Ericson's *Real-Time Collision Detection*
+(section 5.1.9). The points on the two segments are $P_1 + s\,d_1$ and $P_2 + t\,d_2$ with
+$s, t \in [0, 1]$. Minimising the squared distance over $s$ and $t$ gives a small linear system;
+its solution is clamped to the segments, and when one parameter is clamped, the other is recomputed
+for the clamped value. Segments of (nearly) zero length are points and are handled first. The
+function returns the *squared* distance, so that the common case, two cells far enough apart, needs
+no square root.
+
+```{.typescript #overlap-segment-distance}
+export function segmentDistanceSquared(
+  p1x: number, p1y: number, q1x: number, q1y: number,
+  p2x: number, p2y: number, q2x: number, q2y: number,
+): number {
+  const d1x = q1x - p1x, d1y = q1y - p1y;
+  const d2x = q2x - p2x, d2y = q2y - p2y;
+  const rx = p1x - p2x, ry = p1y - p2y;
+  const a = d1x * d1x + d1y * d1y;
+  const e = d2x * d2x + d2y * d2y;
+  const f = d2x * rx + d2y * ry;
+  const EPS = 1e-12;
+  let s: number, t: number;
+  if (a <= EPS && e <= EPS) {
+    s = 0; t = 0;
+  } else if (a <= EPS) {
+    s = 0; t = clamp01(f / e);
+  } else {
+    const c = d1x * rx + d1y * ry;
+    if (e <= EPS) {
+      t = 0; s = clamp01(-c / a);
+    } else {
+      const b = d1x * d2x + d1y * d2y;
+      const denom = a * e - b * b;
+      s = denom > EPS ? clamp01((b * f - c * e) / denom) : 0;
+      t = (b * s + f) / e;
+      if (t < 0) { t = 0; s = clamp01(-c / a); } else if (t > 1) { t = 1; s = clamp01((b - c) / a); }
+    }
+  }
+  const dx = p1x + d1x * s - (p2x + d2x * t);
+  const dy = p1y + d1y * s - (p2y + d2y * t);
+  return dx * dx + dy * dy;
+}
+```
+
+```{.typescript #overlap-clamp}
+function clamp01(v: number): number {
+  return v < 0 ? 0 : v > 1 ? 1 : v;
+}
+```
+
+## The meter
+
+Testing every pair of ~1750 cells would take 1.5 million segment distances per measurement.
+Instead, the meter sorts the cells into a grid and only tests cells in neighbouring grid squares.
+It runs at every snapshot (in the runner when an overlap log is requested, and always in the
+browser) and, in the browser's diagnostic view, on every frame in which the simulation has moved,
+so it keeps its arrays between calls and grows them only when the colony grows.
+
+```{.typescript #overlap-meter}
+export class OverlapMeter {
+  <<overlap-meter-buffers>>
+
+  <<overlap-measure>>
+
+  <<overlap-ensure>>
+}
+```
+
+The buffers hold, per cell, the two ends of its axis ($a$ and $b$) and its centre ($c$); the grid
+square of each cell, and the cells ordered by grid square; the start of each square in that order;
+and the depths of the overlapping pairs, for the percentile.
+
+```{.typescript #overlap-meter-buffers}
+private ax = new Float64Array(0); private ay = new Float64Array(0);
+private bx = new Float64Array(0); private by = new Float64Array(0);
+private cx = new Float64Array(0); private cy = new Float64Array(0);
+private binOf = new Int32Array(0); private order = new Int32Array(0);
+private binStart = new Int32Array(0);
+private depths = new Float64Array(0);
+```
+
+```{.typescript #overlap-ensure}
+private ensure(n: number): void {
+  if (this.ax.length >= n) { return; }
+  const m = Math.max(n, 2 * this.ax.length, 1024);
+  this.ax = new Float64Array(m); this.ay = new Float64Array(m);
+  this.bx = new Float64Array(m); this.by = new Float64Array(m);
+  this.cx = new Float64Array(m); this.cy = new Float64Array(m);
+  this.binOf = new Int32Array(m); this.order = new Int32Array(m);
+}
+```
+
+`measure` takes the simulation, the cell radius and the depth that counts as "over target". An
+optional callback receives every overlapping pair, as indices into the order of `forEachCell`; the
+browser uses it to highlight the pairs. The measurement has four stages:
+
+```{.typescript #overlap-measure}
+public measure(sim: Simulation, radius: number, targetDepth: number,
+  onPair?: (i: number, j: number, depth: number) => void): OverlapStats {
+  <<overlap-gather>>
+
+  <<overlap-bin>>
+
+  <<overlap-pairs>>
+
+  <<overlap-walls>>
+
+  <<overlap-result>>
+}
+```
+
+### 1. Gather the axes
+
+A cell's long axis is its local $y$ axis, which points along $(-\sin\theta, \cos\theta)$. The ends
+of the axis are the centre plus and minus half the length along it. The longest cell is noted too:
+it sets the size of the grid squares.
+
+```{.typescript #overlap-gather}
+const n = sim.cellCount;
+this.ensure(n);
+const { ax, ay, bx, by, cx, cy } = this;
+let k = 0, maxLength = 0;
+sim.forEachCell((x, y, angle, length) => {
+  const h = length / 2, ux = -Math.sin(angle) * h, uy = Math.cos(angle) * h;
+  ax[k] = x - ux; ay[k] = y - uy; bx[k] = x + ux; by[k] = y + uy; cx[k] = x; cy[k] = y;
+  if (length > maxLength) { maxLength = length; }
+  k++;
+});
+```
+
+### 2. Sort the cells into a grid
+
+Two cells can only overlap if their centres are closer than $\ell_\text{max} + 2r$: half a length
+each, plus a radius each. With grid squares that wide, overlapping cells always sit in the same or
+in adjacent squares. The cells are sorted by square with a counting sort: count the cells per
+square, turn the counts into start positions (a running sum), then place each cell at its square's
+next free position.
+
+```{.typescript #overlap-bin}
+const size = maxLength + 2 * radius + 1e-6;
+let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+for (let i = 0; i < n; i++) {
+  if (cx[i] < minX) { minX = cx[i]; } if (cx[i] > maxX) { maxX = cx[i]; }
+  if (cy[i] < minY) { minY = cy[i]; } if (cy[i] > maxY) { maxY = cy[i]; }
+}
+const nx = n > 0 ? Math.floor((maxX - minX) / size) + 1 : 1;
+const ny = n > 0 ? Math.floor((maxY - minY) / size) + 1 : 1;
+const bins = nx * ny;
+if (this.binStart.length < bins + 1) { this.binStart = new Int32Array(bins + 1); }
+const binStart = this.binStart, binOf = this.binOf, order = this.order;
+binStart.fill(0, 0, bins + 1);
+for (let i = 0; i < n; i++) {
+  const b = Math.floor((cy[i] - minY) / size) * nx + Math.floor((cx[i] - minX) / size);
+  binOf[i] = b;
+  binStart[b + 1]++;
+}
+for (let b = 0; b < bins; b++) { binStart[b + 1] += binStart[b]; }
+const fill = binStart.slice(0, bins);
+for (let i = 0; i < n; i++) { order[fill[binOf[i]]++] = i; }
+```
+
+### 3. Test the pairs
+
+Each cell is tested against the cells in its own and the eight surrounding squares, and each pair
+only once (the other cell's index must be larger). A quick check on the distance between the
+centres skips most pairs before the segment distance is computed. For every overlapping pair, the
+depth is recorded and the statistics updated.
+
+```{.typescript #overlap-pairs}
+const touch = 2 * radius, touch2 = touch * touch;
+let pairs = 0, sum = 0, maxDepth = 0, overTarget = 0;
+const maxAt = { x: NaN, y: NaN }, maxWallAt = { x: NaN, y: NaN };
+for (let i = 0; i < n; i++) {
+  const bxi = binOf[i] % nx, byi = (binOf[i] - bxi) / nx;
+  for (let gy = Math.max(0, byi - 1); gy <= Math.min(ny - 1, byi + 1); gy++) {
+    for (let gx = Math.max(0, bxi - 1); gx <= Math.min(nx - 1, bxi + 1); gx++) {
+      const b = gy * nx + gx;
+      for (let o = binStart[b]; o < binStart[b + 1]; o++) {
+        const j = order[o];
+        if (j <= i) { continue; }
+        const ddx = cx[i] - cx[j], ddy = cy[i] - cy[j];
+        if (ddx * ddx + ddy * ddy > size * size) { continue; }
+        const d2 = segmentDistanceSquared(ax[i], ay[i], bx[i], by[i], ax[j], ay[j], bx[j], by[j]);
+        if (d2 >= touch2) { continue; }
+        const depth = touch - Math.sqrt(d2);
+        if (this.depths.length <= pairs) { const grown = new Float64Array(2 * pairs + 64); grown.set(this.depths); this.depths = grown; }
+        this.depths[pairs++] = depth;
+        sum += depth;
+        if (depth > maxDepth) { maxDepth = depth; maxAt.x = (cx[i] + cx[j]) / 2; maxAt.y = (cy[i] + cy[j]) / 2; }
+        if (depth > targetDepth) { overTarget++; }
+        if (onPair) { onPair(i, j, depth); }
+      }
+    }
+  }
+}
+```
+
+### 4. Test the walls
+
+The walls are the chamber's edges and the sides of the wall triangles, as segments. Only cells
+close enough to reach a wall are tested: within half the longest length plus a radius of a side
+wall or the top wall, with a margin of 1.5 because the triangles stick one unit into the chamber.
+The depth is measured from the wall line, so a cell whose axis crosses a wall counts as depth
+$r$.
+
+```{.typescript #overlap-walls}
+let maxWallDepth = 0;
+const reach = maxLength / 2 + radius + 1.5;
+const segments = wallSegments();
+for (let i = 0; i < n; i++) {
+  if (cx[i] > -50 + reach && cx[i] < 50 - reach && cy[i] < 200 - reach) { continue; }
+  for (let w = 0; w < segments.length; w += 4) {
+    const d2 = segmentDistanceSquared(ax[i], ay[i], bx[i], by[i], segments[w], segments[w + 1], segments[w + 2], segments[w + 3]);
+    if (d2 < radius * radius) {
+      const depth = radius - Math.sqrt(d2);
+      if (depth > maxWallDepth) { maxWallDepth = depth; maxWallAt.x = cx[i]; maxWallAt.y = cy[i]; }
+    }
+  }
+}
+```
+
+### The result
+
+```{.typescript #overlap-result}
+return {
+  step: sim.stepCount, cells: n, overlappingPairs: pairs, maxDepth,
+  meanDepth: pairs > 0 ? sum / pairs : 0,
+  p99Depth: percentile(this.depths.subarray(0, pairs), 0.99),
+  pairsOverTarget: overTarget, maxWallDepth, maxAt, maxWallAt,
+};
+```
+
+## Helpers
+
+The wall segments never change, so they are built once from the [chamber data](model.qmd#the-chamber-geometry)
+and cached, as a flat list of coordinates $x_1, y_1, x_2, y_2, \ldots$
+
+```{.typescript #overlap-wall-segments}
+let wallSegmentCache: Float64Array | null = null;
+
+function wallSegments(): Float64Array {
+  if (wallSegmentCache) { return wallSegmentCache; }
+  const list: number[] = [];
+  for (const [a, b] of CHAMBER.edges) { list.push(a.x, a.y, b.x, b.y); }
+  for (const t of CHAMBER.triangles) {
+    for (let k = 0; k < 3; k++) {
+      const a = t.vertices[k], b = t.vertices[(k + 1) % 3];
+      list.push(a.x + t.offset.x, a.y + t.offset.y, b.x + t.offset.x, b.y + t.offset.y);
+    }
+  }
+  wallSegmentCache = Float64Array.from(list);
+  return wallSegmentCache;
+}
+```
+
+The percentile sorts a copy of the depths (typed arrays sort numerically):
+
+```{.typescript #overlap-percentile}
+function percentile(values: Float64Array, q: number): number {
+  if (values.length === 0) { return 0; }
+  const sorted = Float64Array.from(values).sort();
+  return sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+}
+```

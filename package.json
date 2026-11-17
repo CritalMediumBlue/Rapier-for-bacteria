@@ -5,12 +5,15 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "tangle": "sh tools/tangle.sh",
     "build": "tsc",
     "watch": "tsc --watch",
     "start": "http-server -c-1 -o index.html",
     "simulate": "node build/run.js",
-    "build-site": "npm run build && sh tools/build-site.sh",
-    "clean": "rm -rf build _site"
+    "docs": "quarto render docs",
+    "preview-docs": "quarto preview docs",
+    "build-site": "npm run build && npm run docs && sh tools/build-site.sh",
+    "clean": "rm -rf build _site docs/_site"
   },
   "dependencies": {
     "@dimforge/rapier2d-simd-compat": "0.21.0"

@@ -2,3 +2,7 @@
 /build/
 /output/
 /_site/
+/.venv/
+/.entangled/
+/docs/_site/
+/docs/.quarto/

@@ -1,4 +1,7 @@
-# Rapier port: notes
+---
+title: "Development notes"
+subtitle: "The port from Box2D to Rapier: decisions, settings, performance and validation"
+---
 
 Overnight work log for porting the microfluidic biofilm simulation from the Box2D port to
 [Rapier](https://rapier.rs) (`@dimforge/rapier2d-compat` 0.21.0, 2D, WebAssembly).
@@ -55,7 +58,7 @@ Overnight work log for porting the microfluidic biofilm simulation from the Box2
 
 ## How to run
 
-See the [README](../README.md).
+See [Working on the code](index.qmd#working-on-the-code).
 
 ## What was implemented
 

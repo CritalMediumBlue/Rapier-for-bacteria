@@ -4,7 +4,12 @@ Rod-shaped bacteria growing, dividing and pushing each other as a monolayer in a
 chamber, simulated with the [Rapier](https://rapier.rs) 2D physics engine. Runs in the browser
 and on the command line.
 
-**Live demo:** https://critalmediumblue.github.io/Rapier-for-bacteria/
+- **How it works:** https://critalmediumblue.github.io/Rapier-for-bacteria/
+- **Run it:** https://critalmediumblue.github.io/Rapier-for-bacteria/simulation/
+
+The code is a literate program: the pages in `docs/*.qmd` explain every line, and the source files
+(`src/*.ts`, `index.html`) are generated from them with [Entangled](https://entangled.github.io).
+Edit the `.qmd` files, not the generated ones.
 
 ## Quick start
 
@@ -28,19 +33,17 @@ node build/run.js --list-params                      # all parameters and defaul
 node build/run.js --help                             # all options
 ```
 
-## Code
+## Changing the code
 
-| File | |
-|---|---|
-| `src/model.ts` | parameters with defaults, chamber geometry, cell mass and drag |
-| `src/simulation.ts` | the `Simulation` class: the model on Rapier (growth, division, anchoring, snapshots) |
-| `src/states.ts` | records snapshots and lineage as JSON |
-| `src/overlap.ts` | measures cell–cell and cell–wall penetration |
-| `src/rng.ts` | seeded random numbers |
-| `src/run.ts` | command-line entry point |
-| `src/viewer.ts`, `src/render.ts` | browser entry point and drawing |
-| `tools/` | site build script and Python analysis scripts |
-| `docs/` | design notes and validation reports |
+Also requires Entangled (`pip install entangled-cli`) and, for the documentation,
+[Quarto](https://quarto.org).
+
+```sh
+npm run tangle       # docs/*.qmd -> src/*.ts, index.html
+npm run build
+npm run docs         # renders the documentation into docs/_site
+npm run build-site   # the whole website in _site/: documentation, simulation in simulation/
+```
 
 ## Output format
 

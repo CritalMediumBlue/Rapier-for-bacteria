@@ -1,0 +1,480 @@
+---
+title: "The browser viewer"
+subtitle: "`index.html` and `src/viewer.ts`: watching the colony grow"
+---
+
+The browser version runs the same simulation as the command line, draws it on a canvas as it
+runs, measures overlaps at every snapshot, and saves the recorded states. It is the
+[live demo](simulation/index.html) of this site. It is a single static page with no server-side
+code; [drawing](rendering.qmd) has its own chapter.
+
+## The page
+
+The page is a header with the controls and a status line, and a canvas that takes the rest of the
+window.
+
+```{.html file=index.html}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Microfluidic Biofilm</title>
+  <<page-style>>
+</head>
+<body>
+  <<page-header>>
+  <canvas id="canvas"></canvas>
+  <<page-scripts>>
+</body>
+</html>
+```
+
+The layout is a column: the header wraps its controls onto several lines on narrow screens, and the
+canvas fills the remaining height. Numbers use tabular figures so that the status line does not
+jitter as they change; the overlap readout turns green or red against the target.
+
+```{.html #page-style}
+<style>
+  body { margin: 0; font: 14px system-ui, sans-serif; background: #fff; color: #222; display: flex; flex-direction: column; height: 100vh; }
+  header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; padding: 8px 12px; border-bottom: 1px solid #ddd; }
+  header h1 { font-size: 16px; margin: 0 8px 0 0; }
+  button { font: inherit; padding: 3px 10px; }
+  input[type=number] { width: 6em; font: inherit; }
+  #status, #overlap { font-variant-numeric: tabular-nums; color: #555; }
+  #overlap.ok { color: #1a7f37; }
+  #overlap.bad { color: #c62828; font-weight: 600; }
+  select { font: inherit; }
+  #canvas { flex: 1; width: 100%; min-height: 0; display: block; }
+  kbd { border: 1px solid #ccc; border-radius: 3px; padding: 0 4px; font-size: 12px; }
+</style>
+```
+
+The controls: pause, single step and save (also on the keyboard: Space, N and J), the number of
+steps per frame, the view, and the settings that apply when the simulation is restarted: the seed
+(blank for a random one) and the snapshot interval. Then the status line, the overlap readout, a
+reminder of the keys, and a link to this site.
+
+```{.html #page-header}
+<header>
+  <h1>Microfluidic Biofilm</h1>
+  <button id="pause" title="Space">Pause</button>
+  <button id="step" title="N">Step</button>
+  <button id="save" title="J">Save states…</button>
+  <label>Steps/frame <input id="speed" type="number" min="1" max="200" value="1"></label>
+  <label>View <select id="style">
+    <option value="simple">Simple</option>
+    <option value="diagnostic">Diagnostic (overlaps)</option>
+  </select></label>
+  <label>Seed <input id="seed" type="number" min="0" placeholder="random"></label>
+  <label title="Steps between snapshots (multiple of 25); applies on Restart">Snapshot every <input id="snapshotInterval" type="number" min="25" step="25" value="300"> steps</label>
+  <button id="restart" title="Restart with these settings (blank seed = random); unsaved states are lost">Restart</button>
+  <span id="status"></span>
+  <span id="overlap"></span>
+  <span style="color:#888"><kbd>Space</kbd> pause · <kbd>N</kbd> step · <kbd>J</kbd> save</span>
+  <a href="https://critalmediumblue.github.io/Rapier-for-bacteria/">How it works</a>
+</header>
+```
+
+The compiled TypeScript imports Rapier by its npm package name, which a browser cannot resolve on
+its own. An *import map* tells it where that file is: in the repository, inside `node_modules`;
+the published site keeps the same path (`tools/build-site.sh` copies the file there). The viewer is
+loaded as an ES module.
+
+```{.html #page-scripts}
+<script type="importmap">
+  { "imports": { "@dimforge/rapier2d-simd-compat": "./node_modules/@dimforge/rapier2d-simd-compat/dist/rapier.mjs" } }
+</script>
+<script type="module" src="./build/viewer.js"></script>
+```
+
+## The viewer
+
+`viewer.ts` is a plain script: it looks up the page's elements, reads the settings from the URL,
+starts a simulation and drives it from the browser's animation frames.
+
+```{.typescript file=src/viewer.ts}
+<<viewer-imports>>
+
+<<viewer-constants>>
+
+<<viewer-file-handle>>
+
+<<viewer-elements>>
+
+<<viewer-url-settings>>
+
+<<viewer-state>>
+
+<<viewer-start>>
+
+<<viewer-advance>>
+
+<<viewer-frame>>
+
+<<viewer-render>>
+
+<<viewer-saving>>
+
+<<viewer-controls>>
+
+<<viewer-scripting>>
+
+void startSimulation().then(() => requestAnimationFrame(frame));
+```
+
+```{.typescript #viewer-imports}
+import { DEFAULT_PARAMS, SimulationParams } from "./model.js";
+import { OVERLAP_TARGET_FRACTION, OVERLAP_WARMUP_STEPS, OverlapMeter, OverlapStats } from "./overlap.js";
+import { ChamberRenderer, RENDER_STYLES, RenderStyle, ViewRect } from "./render.js";
+import { Simulation, rapierVersion } from "./simulation.js";
+```
+
+The states are saved automatically every 500 snapshots. The diagnostic view highlights overlaps
+deeper than 1% of the cell width: resting contacts always sit 0.1–0.5% deep (the solver's
+tolerance), and highlighting those would colour the whole colony.
+
+```{.typescript #viewer-constants}
+const AUTO_SAVE_EVERY_SNAPSHOTS = 500;
+const OVERLAP_VISIBLE_FRACTION = 0.01;
+const STATES_FILE_NAME = "states.json";
+```
+
+### Elements and settings
+
+Saving to a file the user picked uses the File System Access API, available in Chrome and Edge.
+TypeScript's standard DOM types do not include it yet, so the few members used are declared here.
+
+```{.typescript #viewer-file-handle}
+interface WritableFileHandle {
+  name: string;
+  createWritable(): Promise<{ write(data: Blob): Promise<void>, close(): Promise<void> }>;
+}
+```
+
+```{.typescript #viewer-elements}
+const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
+const canvas = $<HTMLCanvasElement>("canvas");
+const renderer = new ChamberRenderer(canvas.getContext("2d")!);
+const statusEl = $("status");
+const overlapEl = $("overlap");
+const pauseBtn = $<HTMLButtonElement>("pause");
+const speedInput = $<HTMLInputElement>("speed");
+const seedInput = $<HTMLInputElement>("seed");
+const styleSelect = $<HTMLSelectElement>("style");
+const snapshotInput = $<HTMLInputElement>("snapshotInterval");
+```
+
+Every setting can be given in the URL, so a particular run or view can be shared as a link, e.g.
+`index.html?seed=7&speed=20&style=diagnostic&anchorMaxStretch=1`:
+
+| URL parameter | Effect |
+|---|---|
+| `seed` | the random seed |
+| `speed` | steps per frame |
+| `style` | `simple` or `diagnostic` |
+| `view` | `minX,minY,maxX,maxY`: zoom into a part of the chamber, e.g. `-50,185,-35,200` for the top-left corner |
+| any model parameter | overrides its default, e.g. `snapshotInterval=600` |
+
+Model parameters are recognised by their names in `DEFAULT_PARAMS`, as on the command line. The
+seed, speed, style and snapshot interval are copied into the controls, where they can be changed
+before a restart.
+
+```{.typescript #viewer-url-settings}
+const query = new URLSearchParams(location.search);
+const urlOverrides: Partial<SimulationParams> = {};
+for (const [key, value] of query) {
+  if (key in DEFAULT_PARAMS && value !== "" && !Number.isNaN(Number(value))) {
+    (urlOverrides as Record<string, number>)[key] = Number(value);
+  }
+}
+const urlStyle = query.get("style") as RenderStyle | null;
+styleSelect.value = urlStyle && RENDER_STYLES.includes(urlStyle) ? urlStyle : "simple";
+if (query.get("seed")) { seedInput.value = query.get("seed")!; }
+if (query.get("speed")) { speedInput.value = query.get("speed")!; }
+snapshotInput.value = String(urlOverrides.snapshotInterval ?? DEFAULT_PARAMS.snapshotInterval);
+const viewParts = (query.get("view") ?? "").split(",").map(Number);
+let view: ViewRect | undefined = viewParts.length === 4 && viewParts.every(Number.isFinite) && viewParts[0] < viewParts[2] && viewParts[1] < viewParts[3]
+  ? { minX: viewParts[0], minY: viewParts[1], maxX: viewParts[2], maxY: viewParts[3] } : undefined;
+```
+
+### State
+
+The viewer's state: the simulation (none while one is being created), whether it is paused, the
+file being saved to, and counters for the speed readout. The overlap meter is shared between the
+snapshot measurements and the diagnostic view. The diagnostic view's overlapping pairs are kept in
+fixed arrays (up to 4096 pairs), and only re-measured when the simulation has moved.
+
+```{.typescript #viewer-state}
+let sim: Simulation | null = null;
+let paused = false;
+let saveHandle: WritableFileHandle | null = null;
+let saving = false;
+let lastSaveInfo = "not saved yet";
+let rateSteps = 0, rateFrames = 0, rateStepMs = 0, rateDrawMs = 0, rateTime = performance.now();
+let stepsPerSecond = 0, framesPerSecond = 0, stepMsPerFrame = 0, drawMsPerFrame = 0;
+const meter = new OverlapMeter();
+let lastOverlap: OverlapStats | null = null;
+const pairs = { i: new Int32Array(4096), j: new Int32Array(4096), depth: new Float64Array(4096), count: 0 };
+let pairsStep = -1;
+```
+
+A new simulation takes the URL's parameters, the snapshot interval and the seed from the controls.
+If the parameters are invalid, the error appears in the status line.
+
+```{.typescript #viewer-start}
+async function startSimulation(): Promise<void> {
+  const seedText = seedInput.value.trim();
+  const overrides: Partial<SimulationParams> = { ...urlOverrides, snapshotInterval: Number(snapshotInput.value) };
+  if (seedText !== "") { overrides.seed = Number(seedText); }
+  try {
+    sim = await Simulation.create(overrides);
+  } catch (e) {
+    statusEl.textContent = `could not start: ${e instanceof Error ? e.message : String(e)}`;
+    console.error(e);
+    return;
+  }
+  lastOverlap = null;
+  pairsStep = -1;
+  console.log(`Simulation started: Rapier ${rapierVersion()}, seed ${sim.params.seed}`);
+}
+```
+
+### The loop
+
+`advance` runs a number of steps. At every snapshot it measures the overlaps for the readout and,
+every 500 snapshots, saves. If the physics engine fails, the viewer pauses and says so; the
+snapshots recorded until then can still be saved.
+
+```{.typescript #viewer-advance}
+function advance(steps: number): void {
+  if (!sim) { return; }
+  for (let i = 0; i < steps; i++) {
+    let snapshotTaken: boolean;
+    try {
+      snapshotTaken = sim.step();
+    } catch (e) {
+      console.error(`The simulation failed at step ${sim.stepCount + 1}:`, e);
+      if (!paused) { togglePause(); }
+      lastSaveInfo = `SIMULATION FAILED at step ${sim.stepCount + 1} (see console); save with J to keep the snapshots`;
+      return;
+    }
+    rateSteps++;
+    if (snapshotTaken) {
+      lastOverlap = meter.measure(sim, sim.params.radius, OVERLAP_TARGET_FRACTION * 2 * sim.params.radius);
+      if (sim.states.snapshotCount % AUTO_SAVE_EVERY_SNAPSHOTS === 0) { void saveStates(true); }
+    }
+  }
+}
+```
+
+Each animation frame advances the simulation by the chosen number of steps (1 to 200), then draws
+it. The time spent on each is accumulated, and once a second the readout's averages are updated.
+With a full chamber a step takes about 5 ms, so one step per frame leaves plenty of room in a
+60 Hz frame, and more steps per frame trade smoothness for speed.
+
+```{.typescript #viewer-frame}
+function frame(): void {
+  const t0 = performance.now();
+  if (!paused) {
+    const steps = Math.max(1, Math.min(200, Math.floor(Number(speedInput.value) || 1)));
+    advance(steps);
+  }
+  const t1 = performance.now();
+  render();
+  const t2 = performance.now();
+  rateStepMs += t1 - t0;
+  rateDrawMs += t2 - t1;
+  rateFrames++;
+  if (t2 - rateTime >= 1000) {
+    stepsPerSecond = (rateSteps * 1000) / (t2 - rateTime);
+    framesPerSecond = (rateFrames * 1000) / (t2 - rateTime);
+    stepMsPerFrame = rateStepMs / rateFrames;
+    drawMsPerFrame = rateDrawMs / rateFrames;
+    rateSteps = rateFrames = rateStepMs = rateDrawMs = 0;
+    rateTime = t2;
+  }
+  requestAnimationFrame(frame);
+}
+```
+
+### Drawing a frame
+
+The canvas is sized in device pixels, so that lines stay sharp on high-resolution screens. In the
+diagnostic view, the overlapping pairs deeper than 1% of the width are collected (once per step
+the simulation has moved) and handed to the [renderer](rendering.qmd) together with the target
+depth. Then the status line and the overlap readout are updated; during the warm-up the readout
+explains why the overlaps are still large.
+
+```{.typescript #viewer-render}
+function render(): void {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== Math.round(w * dpr) || canvas.height !== Math.round(h * dpr)) {
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+  if (!sim) { return; }
+  const style = styleSelect.value as RenderStyle;
+  const radius = sim.params.radius;
+  const targetDepth = OVERLAP_TARGET_FRACTION * 2 * radius;
+  if (style === "diagnostic" && sim.stepCount !== pairsStep) {
+    pairsStep = sim.stepCount;
+    pairs.count = 0;
+    const visible = OVERLAP_VISIBLE_FRACTION * 2 * radius;
+    meter.measure(sim, radius, targetDepth, (i, j, depth) => {
+      if (depth < visible || pairs.count === pairs.i.length) { return; }
+      pairs.i[pairs.count] = i; pairs.j[pairs.count] = j; pairs.depth[pairs.count] = depth; pairs.count++;
+    });
+  }
+  renderer.draw(sim, { style, radius, view, overlaps: style === "diagnostic" ? pairs : undefined, targetDepth });
+
+  statusEl.textContent =
+    `step ${sim.stepCount} · ${sim.cellCount} cells · ${sim.states.snapshotCount} snapshots · ` +
+    `${stepsPerSecond.toFixed(0)} steps/s · ${framesPerSecond.toFixed(0)} fps ` +
+    `(step ${stepMsPerFrame.toFixed(1)} ms + draw ${drawMsPerFrame.toFixed(1)} ms per frame) · ` +
+    `seed ${sim.params.seed} · ${lastSaveInfo}`;
+  if (lastOverlap) {
+    const width = 2 * radius;
+    const max = lastOverlap.maxDepth / width * 100, mean = lastOverlap.meanDepth / width * 100;
+    const warmup = lastOverlap.step < OVERLAP_WARMUP_STEPS;
+    overlapEl.textContent = `overlap at step ${lastOverlap.step}: max ${max.toFixed(1)}% · mean ${mean.toFixed(2)}% of cell width` +
+      (warmup ? ` (warm-up: random initial placement relaxing until step ${OVERLAP_WARMUP_STEPS})` : ` (target < ${OVERLAP_TARGET_FRACTION * 100}%)`);
+    overlapEl.className = warmup ? "" : max < OVERLAP_TARGET_FRACTION * 100 ? "ok" : "bad";
+  } else {
+    overlapEl.textContent = "overlap: measured at each snapshot";
+    overlapEl.className = "";
+  }
+}
+```
+
+### Saving
+
+A browser page cannot simply write to disk. There are two ways out:
+
+- **Chrome and Edge** offer a file picker that returns a *handle* to a file of the user's choice.
+  The first save asks for the file; later saves, including the automatic ones, overwrite it
+  without asking.
+- **Other browsers** can only download: the file is built as a `Blob` and offered as a download,
+  as `states.json` when saved by hand and as numbered copies when saved automatically.
+
+The `Blob` is built from the recorder's [pieces](recording.qmd#writing-the-file). Only one save
+runs at a time; an automatic save that comes due during another is skipped.
+
+```{.typescript #viewer-saving}
+function buildBlob(): Blob {
+  return new Blob(sim!.states.toPieces(), { type: "application/json" });
+}
+
+function download(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.download = fileName;
+  link.href = url;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function saveStates(auto: boolean): Promise<void> {
+  if (saving || !sim) { return; }
+  saving = true;
+  try {
+    const blob = buildBlob();
+    let target: string;
+    if (saveHandle) {
+      const writable = await saveHandle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      target = saveHandle.name;
+    } else {
+      target = auto ? `states_${sim.states.snapshotCount}.json` : STATES_FILE_NAME;
+      download(blob, target);
+    }
+    lastSaveInfo = `saved ${sim.states.snapshotCount} snapshots to ${target} at step ${sim.stepCount}`;
+    console.log(`${lastSaveInfo} (${(blob.size / 1e6).toFixed(1)} MB)`);
+  } catch (e) {
+    lastSaveInfo = "save FAILED (see console)";
+    console.error("Saving states failed:", e);
+  } finally {
+    saving = false;
+  }
+}
+
+async function chooseFileAndSave(): Promise<void> {
+  const picker = (window as any).showSaveFilePicker;
+  if (picker && !saveHandle) {
+    try {
+      saveHandle = await picker({
+        suggestedName: STATES_FILE_NAME,
+        types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
+      });
+    } catch {
+      return;
+    }
+  }
+  await saveStates(false);
+}
+```
+
+### Controls
+
+Stepping once pauses the simulation first. Restarting asks for confirmation if there are recorded
+states, and forgets the file of the previous run, so that the new run does not overwrite it. Keys
+typed into the input fields are left alone. Leaving the page with recorded states makes the
+browser ask for confirmation.
+
+```{.typescript #viewer-controls}
+function togglePause(): void {
+  paused = !paused;
+  pauseBtn.textContent = paused ? "Resume" : "Pause";
+}
+
+function stepOnce(): void {
+  if (!paused) { togglePause(); }
+  advance(1);
+}
+
+async function restart(): Promise<void> {
+  if (sim && sim.states.snapshotCount > 0 && !confirm("Restart the simulation? Unsaved states will be lost.")) { return; }
+  sim = null;
+  await startSimulation();
+  saveHandle = null;
+  lastSaveInfo = "not saved yet";
+}
+
+pauseBtn.addEventListener("click", togglePause);
+$("step").addEventListener("click", stepOnce);
+$("save").addEventListener("click", () => void chooseFileAndSave());
+$("restart").addEventListener("click", () => void restart());
+window.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement) { return; }
+  switch (e.key) {
+    case " ": e.preventDefault(); togglePause(); break;
+    case "n": case "N": stepOnce(); break;
+    case "j": case "J": void chooseFileAndSave(); break;
+  }
+});
+window.addEventListener("beforeunload", (e) => {
+  if (sim && sim.states.snapshotCount > 0) { e.preventDefault(); }
+});
+```
+
+### Scripting
+
+`window.biofilm` makes the viewer usable from the browser console or from a headless browser, e.g.
+to take screenshots at given steps. It exposes the simulation, the latest overlap measurement and
+the timing, and lets a script pause, resume, advance, zoom (`setView({minX, minY, maxX, maxY})`, or
+no argument for the whole chamber) and download the states without the file picker.
+
+```{.typescript #viewer-scripting}
+(window as any).biofilm = {
+  get sim() { return sim; },
+  get overlap() { return lastOverlap; },
+  get timing() { return { stepsPerSecond, framesPerSecond, stepMsPerFrame, drawMsPerFrame }; },
+  download: (fileName: string = STATES_FILE_NAME) => { if (sim) { download(buildBlob(), fileName); } },
+  pause: () => { if (!paused) { togglePause(); } },
+  resume: () => { if (paused) { togglePause(); } },
+  advance,
+  setView: (rect?: ViewRect) => { view = rect; },
+};
+```

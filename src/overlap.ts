@@ -1,41 +1,18 @@
-/**
- * Overlap check: penetration depth between every pair of touching cells (capsule–capsule), and
- * of cells into the chamber walls, measured on the live simulation at full precision.
- *
- * (The exported states are rounded to 2 decimals — `an` to 0.01·π — which alone can move a cell
- * tip by ~0.03, so overlaps must be measured here, not from the exported file.)
- *
- * Each cell is a capsule: a segment between its end-cap centres, swept by `radius`. Two cells
- * overlap by 2·radius − (distance between their segments) when that is positive.
- */
-
 import { CHAMBER } from "./model.js";
 import type { Simulation } from "./simulation.js";
 
-/**
- * Target: max cell–cell penetration below this fraction of the cell width. Originally 0.05; relaxed
- * to 0.08 on 14 November in exchange for fewer solver iterations (faster steps; NOTES.md).
- */
 export const OVERLAP_TARGET_FRACTION = 0.08;
-/** Steps to let the random initial placement (heavily overlapping) relax before the target applies. */
 export const OVERLAP_WARMUP_STEPS = 3000;
 
 export interface OverlapStats {
   step: number;
   cells: number;
-  /** Pairs of cells that overlap at all (penetration > 0). */
   overlappingPairs: number;
-  /** Deepest cell–cell penetration. */
   maxDepth: number;
-  /** Mean penetration over the overlapping pairs (0 if there are none). */
   meanDepth: number;
-  /** 99th percentile of penetration over the overlapping pairs. */
   p99Depth: number;
-  /** Pairs deeper than the target. */
   pairsOverTarget: number;
-  /** Deepest penetration of a cell into the side or top walls or their triangles. */
   maxWallDepth: number;
-  /** Where the deepest cell–cell overlap is (midpoint of the two centres) and the deepest wall contact (cell centre). */
   maxAt: { x: number, y: number };
   maxWallAt: { x: number, y: number };
 }
@@ -49,7 +26,6 @@ export function overlapCsvRow(s: OverlapStats, width: number): string {
     s.maxAt.x.toFixed(2), s.maxAt.y.toFixed(2), s.maxWallAt.x.toFixed(2), s.maxWallAt.y.toFixed(2)].join(",");
 }
 
-/** Squared distance between segments p1–q1 and p2–q2 (Ericson, Real-Time Collision Detection, 5.1.9). */
 export function segmentDistanceSquared(
   p1x: number, p1y: number, q1x: number, q1y: number,
   p2x: number, p2y: number, q2x: number, q2y: number,
@@ -87,7 +63,6 @@ function clamp01(v: number): number {
   return v < 0 ? 0 : v > 1 ? 1 : v;
 }
 
-/** Measures overlaps; keeps its buffers between calls so repeated checks don't allocate. */
 export class OverlapMeter {
   private ax = new Float64Array(0); private ay = new Float64Array(0);
   private bx = new Float64Array(0); private by = new Float64Array(0);
@@ -96,26 +71,19 @@ export class OverlapMeter {
   private binStart = new Int32Array(0);
   private depths = new Float64Array(0);
 
-  /**
-   * @param radius cell radius (half the width)
-   * @param targetDepth depth counted in `pairsOverTarget`
-   * @param onPair optional callback for every overlapping pair (cell indices in forEachCell order)
-   */
   public measure(sim: Simulation, radius: number, targetDepth: number,
     onPair?: (i: number, j: number, depth: number) => void): OverlapStats {
-    // Gather segments
     const n = sim.cellCount;
     this.ensure(n);
     const { ax, ay, bx, by, cx, cy } = this;
     let k = 0, maxLength = 0;
     sim.forEachCell((x, y, angle, length) => {
-      const h = length / 2, ux = -Math.sin(angle) * h, uy = Math.cos(angle) * h; // long axis = local y
+      const h = length / 2, ux = -Math.sin(angle) * h, uy = Math.cos(angle) * h;
       ax[k] = x - ux; ay[k] = y - uy; bx[k] = x + ux; by[k] = y + uy; cx[k] = x; cy[k] = y;
       if (length > maxLength) { maxLength = length; }
       k++;
     });
 
-    // Bin cell centres on a grid at least one "max reach" wide: overlapping cells are in adjacent bins
     const size = maxLength + 2 * radius + 1e-6;
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (let i = 0; i < n; i++) {
@@ -134,10 +102,9 @@ export class OverlapMeter {
       binStart[b + 1]++;
     }
     for (let b = 0; b < bins; b++) { binStart[b + 1] += binStart[b]; }
-    const fill = binStart.slice(0, bins); // write cursor per bin (one small allocation per call)
+    const fill = binStart.slice(0, bins);
     for (let i = 0; i < n; i++) { order[fill[binOf[i]]++] = i; }
 
-    // Test each pair once (j > i) within the 3x3 neighbourhood
     const touch = 2 * radius, touch2 = touch * touch;
     let pairs = 0, sum = 0, maxDepth = 0, overTarget = 0;
     const maxAt = { x: NaN, y: NaN }, maxWallAt = { x: NaN, y: NaN };
@@ -165,10 +132,8 @@ export class OverlapMeter {
       }
     }
 
-    // Walls: side and top edges, and the small triangles along them. Only cells close enough to
-    // reach a wall are tested. A cell axis crossing a wall counts as depth = radius.
     let maxWallDepth = 0;
-    const reach = maxLength / 2 + radius + 1.5; // triangles stick 1 unit into the chamber
+    const reach = maxLength / 2 + radius + 1.5;
     const segments = wallSegments();
     for (let i = 0; i < n; i++) {
       if (cx[i] > -50 + reach && cx[i] < 50 - reach && cy[i] < 200 - reach) { continue; }
@@ -201,7 +166,6 @@ export class OverlapMeter {
 
 let wallSegmentCache: Float64Array | null = null;
 
-/** Chamber edges and triangle sides as a flat list of segments (x1, y1, x2, y2, ...). */
 function wallSegments(): Float64Array {
   if (wallSegmentCache) { return wallSegmentCache; }
   const list: number[] = [];

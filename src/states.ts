@@ -1,14 +1,3 @@
-/**
- * Records simulation states in the LowRes.json format:
- *
- *   {"1":[{"x":3.99,"y":166.12,"id":1,"an":0.46,"le":3.7}, ...], "2":[...], ..., "lineage":{"1":0, ...}}
- *
- * - snapshot keys count snapshots ("1", "2", ...), cells sorted by ascending id
- * - x, y: body centre; an: orientation as a fraction of π in [0, 1]; le: distance between
- *   the end-cap centres; all rounded to 2 decimals
- * - lineage: child id -> parent id (0 for the initial cells), written last
- */
-
 export interface CellState {
   x: number;
   y: number;
@@ -17,15 +6,12 @@ export interface CellState {
   le: number;
 }
 
-/** Round to 2 decimals (the LowRes coarse graining). */
 export function round2(v: number): number {
   return Math.round(v * 100) / 100;
 }
 
 export class StateRecorder {
-  /** One serialized `"n":[...]` entry per snapshot (kept as text to save memory). */
   private readonly snapshotParts: string[] = [];
-  /** lineage[childId] = parentId */
   private readonly lineage: number[] = [];
   private maxId: number = 0;
 
@@ -42,7 +28,6 @@ export class StateRecorder {
     if (childId > this.maxId) { this.maxId = childId; }
   }
 
-  /** Store one snapshot. Values are rounded here; cells are sorted by id. */
   public addSnapshot(cells: CellState[]): void {
     const sorted = cells.slice().sort((a, b) => a.id - b.id);
     const text = sorted.map((c) => JSON.stringify({
@@ -55,10 +40,6 @@ export class StateRecorder {
     this.snapshotParts.push(`"${this.snapshotParts.length + 1}":[${text}]`);
   }
 
-  /**
-   * The whole file as a list of string pieces, in order. Write them one by one (Node) or
-   * pass them to `new Blob(pieces)` (browser), so no single giant string is ever built.
-   */
   public toPieces(): string[] {
     const pieces: string[] = ["{"];
     this.snapshotParts.forEach((part, i) => {

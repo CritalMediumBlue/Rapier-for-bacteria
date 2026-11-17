@@ -1,0 +1,816 @@
+---
+title: "The simulation"
+subtitle: "`src/simulation.ts`: the model on the Rapier physics engine"
+---
+
+This chapter is the heart of the program. The `Simulation` class owns a Rapier world in which every
+cell is a rigid body with a capsule-shaped collider. On every step Rapier moves the bodies and
+resolves their contacts; then, on growth steps, the model makes cells grow, divide, leave the
+chamber or die, and attaches cells near the side walls to the surface. Every `snapshotInterval`
+steps it records the state of the colony.
+
+The class uses no browser or Node.js APIs, so the same code runs in the
+[command-line runner](cli.qmd) and in the [browser](browser.qmd). Using it takes three lines:
+
+```ts
+const sim = await Simulation.create({ seed: 7 });
+while (sim.stepCount < 3000) { sim.step(); }
+sim.states.toPieces();
+```
+
+## Overview
+
+The file defines two records, one for cells and one for anchors, and the class itself:
+
+```{.typescript file=src/simulation.ts}
+<<sim-imports>>
+
+<<sim-rapier-init>>
+
+<<sim-cell-record>>
+
+<<sim-anchor-record>>
+
+<<sim-wall-thickness>>
+
+export class Simulation {
+  <<sim-fields>>
+
+  <<sim-create>>
+
+  <<sim-constructor>>
+
+  <<sim-public-api>>
+
+  <<sim-step>>
+
+  <<sim-create-world>>
+
+  <<sim-rebuild-world>>
+
+  <<sim-remove-marked-cells>>
+
+  <<sim-remove-anchors>>
+
+  <<sim-damping>>
+
+  <<sim-over-stretched>>
+
+  <<sim-grow-divide-mark>>
+
+  <<sim-take-snapshot>>
+
+  <<sim-create-cell>>
+
+  <<sim-collider-desc>>
+
+  <<sim-resize-collider>>
+
+  <<sim-reset-cell>>
+
+  <<sim-create-anchor>>
+
+  <<sim-detach-anchors>>
+
+  <<sim-create-walls>>
+}
+```
+
+One call to `step()` does the following:
+
+```{mermaid}
+flowchart LR
+  A["<b>Physics</b><br/>Rapier moves the bodies<br/>and resolves contacts"] --> B["<b>Growth</b><br/>if it is a group's turn:<br/>grow, divide, exit, die,<br/>anchor; remove marked cells"]
+  B --> C["<b>Anchors</b><br/>once per cycle:<br/>release expired and<br/>over-stretched ones"]
+  C --> D["<b>Rebuild</b><br/>every 10 000 steps:<br/>fresh Rapier world"]
+  D --> E["<b>Snapshot</b><br/>every 300 steps:<br/>record all cells"]
+```
+
+## Loading Rapier
+
+Rapier is written in Rust and compiled to WebAssembly. The npm package
+`@dimforge/rapier2d-simd-compat` is the build that uses WebAssembly's SIMD instructions (about
+twice as fast as the plain build here) with the WebAssembly module inlined in the JavaScript file,
+so it loads the same way in Node.js and in the browser, without a separate `.wasm` file.
+
+```{.typescript #sim-imports}
+import RAPIER from "@dimforge/rapier2d-simd-compat";
+import type { Collider, ColliderDesc, ImpulseJoint, RigidBody, World } from "@dimforge/rapier2d-simd-compat";
+import {
+  CHAMBER, COLOR_CENTRE, COLOR_INITIAL, COLOR_WALL, DEFAULT_PARAMS, Point, RGB,
+  SimulationParams, cellMassProperties, checkParams, continuousDampingRate, dragFraction, orientationOf,
+} from "./model.js";
+import { Rng, mulberry32, randomSeed } from "./rng.js";
+import { CellState, StateRecorder } from "./states.js";
+```
+
+The WebAssembly module has to be instantiated before any Rapier object is created. `initRapier`
+does that once and hands every later caller the same promise. `rapierVersion` reports the version
+in use; the runner prints it at the start of a run, since results depend on it.
+
+```{.typescript #sim-rapier-init}
+let initialised: Promise<void> | null = null;
+
+export function initRapier(): Promise<void> {
+  if (!initialised) { initialised = RAPIER.init(); }
+  return initialised;
+}
+
+export function rapierVersion(): string {
+  return RAPIER.version();
+}
+```
+
+## The state of the simulation
+
+### Cells
+
+Each cell is a record that ties the model's view of the cell to its Rapier objects:
+
+| Field | Meaning |
+|---|---|
+| `id` | the cell's identity in the recorded states; never reused |
+| `body`, `collider` | the Rapier rigid body and its capsule collider |
+| `sqrtFriction` | the square root of the cell's friction coefficient (see [Creating a cell](#creating-a-cell)) |
+| `flipped` | whether the collider is turned by π on its body (only with `refreshContacts` = 2) |
+| `mass`, `inertia` | fixed at birth |
+| `length` | distance between the centres of the two end caps |
+| `growthRate` | the factor by which the length grows on each growth event |
+| `phase` | the cell's growth group; daughters inherit it |
+| `reproductiveLength` | the length at which the cell divides |
+| `color` | the cell's region colour |
+| `anchors` | the anchors currently holding this cell |
+| `removed` | marked for removal (it left the chamber or died) |
+
+```{.typescript #sim-cell-record}
+interface Cell {
+  id: number;
+  body: RigidBody;
+  collider: Collider;
+  sqrtFriction: number;
+  flipped: boolean;
+  mass: number;
+  inertia: number;
+  length: number;
+  growthRate: number;
+  phase: number;
+  reproductiveLength: number;
+  color: RGB;
+  anchors: Anchor[];
+  removed: boolean;
+}
+```
+
+### Anchors
+
+An anchor is a fixed Rapier body at the point where a cell attached, plus a spring joint between
+that body and the cell. It remembers the step at which it was made (anchors expire), and its spring
+constants, so that the spring can be recreated when the world is rebuilt. `cell` and `joint` become
+`null` when the cell divides or is removed: the anchor point stays until it expires, but holds
+nothing.
+
+```{.typescript #sim-anchor-record}
+interface Anchor {
+  body: RigidBody;
+  x: number;
+  y: number;
+  createdAtStep: number;
+  cell: Cell | null;
+  joint: ImpulseJoint | null;
+  stiffness: number;
+  damping: number;
+}
+```
+
+### The simulation's own fields
+
+```{.typescript #sim-wall-thickness}
+const WALL_THICKNESS = 2;
+```
+
+The public fields are the run's parameters (the defaults with the overrides applied, plus the
+seed), the Rapier world, the recorded states and the step counter. The world is replaced every
+`rebuildInterval` steps, so callers should not keep a reference to it. The private fields are the
+random number generator, the next free cell id, the live cells and anchors, and a reusable zero
+vector for Rapier calls.
+
+```{.typescript #sim-fields}
+public readonly params: SimulationParams;
+public world: World;
+public readonly states: StateRecorder = new StateRecorder();
+public stepCount: number = 0;
+
+private readonly rng: Rng;
+private nextId: number = 1;
+private cells: Cell[] = [];
+private anchors: Anchor[] = [];
+private readonly zero = { x: 0, y: 0 };
+```
+
+## Creating a simulation
+
+`Simulation.create` is the way in: it loads Rapier (once) and builds a simulation. Any parameter
+not given takes its default from `DEFAULT_PARAMS`; without a seed, a random one is drawn (and
+reported in `params.seed`, so the run can be repeated).
+
+```{.typescript #sim-create}
+public static async create(overrides: Partial<SimulationParams> = {}): Promise<Simulation> {
+  await initRapier();
+  return new Simulation(overrides);
+}
+```
+
+The constructor checks the parameters, seeds the random number generator and creates the world.
+Then it scatters the initial cells over the chamber: a random position, angle and length each,
+drawn in that order (the order matters: the same seed must give the same colony). The initial cells
+are dealt into the growth groups in turn. The walls come last, as in the testbed.
+
+```{.typescript #sim-constructor}
+constructor(overrides: Partial<SimulationParams> = {}) {
+  this.params = { ...DEFAULT_PARAMS, seed: randomSeed(), ...overrides };
+  const p = this.params;
+  checkParams(p);
+  this.rng = mulberry32(p.seed);
+  this.world = this.createWorld();
+
+  for (let i = 0; i < p.initialCells; ++i) {
+    const x = this.rng() * (p.maxX - p.minX) + p.minX;
+    const y = this.rng() * (p.maxY - p.minY) + p.minY;
+    const angle = this.rng() * 2 * Math.PI;
+    const size = 0.2 * this.rng() * (p.maxSize - p.minSize) + p.minSize;
+    this.cells.push(this.createCell(x, y, angle, size, COLOR_INITIAL, 0, i % p.growthGroups));
+  }
+  this.createWalls();
+}
+```
+
+## Reading the state
+
+The rest of the program sees the cells only through three members. `forEachCell` reports each
+cell's centre, angle, length, colour and id at full precision; the [overlap check](overlap.qmd)
+and the [drawing](rendering.qmd) use it. `forEachAnchor` reports each anchor point together with
+the centre of the cell it holds, or `null` if it holds nothing. Callbacks avoid building arrays of
+objects on every frame.
+
+```{.typescript #sim-public-api}
+public get cellCount(): number {
+  return this.cells.length;
+}
+
+public forEachCell(fn: (x: number, y: number, angle: number, length: number, color: RGB, id: number) => void): void {
+  for (const cell of this.cells) {
+    const t = cell.body.translation();
+    fn(t.x, t.y, cell.body.rotation(), cell.length, cell.color, cell.id);
+  }
+}
+
+public forEachAnchor(fn: (x: number, y: number, cell: Point | null) => void): void {
+  for (const anchor of this.anchors) {
+    fn(anchor.x, anchor.y, anchor.cell ? anchor.cell.body.translation() : null);
+  }
+}
+```
+
+## One step
+
+`step()` advances the simulation by $1/\text{hertz}$ and returns whether it recorded a snapshot.
+First Rapier advances the world. Then the step's position in the growth cycle,
+$\text{offset} = \text{stepCount} \bmod G$, decides what else happens. With $G = 25$ and 5 groups,
+the groups' slots are 5 steps apart: group 0 grows when the offset is 0, group 1 when it is 5, and
+so on. Removing cells is only needed when some were marked. Anchors are checked once per cycle, at
+offset 0. With the collider-replacement fix (`refreshContacts` = 1), the world is rebuilt every
+`rebuildInterval` steps, for the reason explained in [Growing a collider](#growing-a-collider).
+
+```{.typescript #sim-step}
+public step(): boolean {
+  const p = this.params;
+  for (let i = 0; i < p.substeps; i++) { this.world.step(); }
+  this.stepCount += 1;
+  const offset = this.stepCount % p.growthInterval;
+  const spacing = p.growthInterval / p.growthGroups;
+
+  if (offset % spacing === 0 && this.growDivideAndMark(offset / spacing)) { this.removeMarkedCells(); }
+
+  if (offset === 0) { this.removeAnchors(); }
+
+  if (p.refreshContacts === 1 && p.rebuildInterval > 0 && this.stepCount % p.rebuildInterval === 0) {
+    this.rebuildWorld();
+  }
+
+  if (this.stepCount % p.snapshotInterval === 0) {
+    this.takeSnapshot();
+    return true;
+  }
+  return false;
+}
+```
+
+## The Rapier world
+
+The world has no gravity: the chamber is seen from above, and the cells lie flat in it. The time
+step and the solver settings come from the [parameters](model.qmd#time-stepping-and-the-solver).
+The contact stiffness is set through Rapier's *contact natural frequency*: the stiffer the
+contacts, the less cells sink into each other under pressure.
+
+```{.typescript #sim-create-world}
+private createWorld(): World {
+  const p = this.params;
+  const world = new RAPIER.World({ x: 0, y: 0 });
+  world.timestep = 1 / (p.hertz * p.substeps);
+  world.numSolverIterations = p.solverIterations;
+  world.numInternalPgsIterations = p.pgsIterations;
+  if (p.contactFrequency > 0) {
+    world.integrationParameters.contact_natural_frequency = p.contactFrequency;
+  }
+  return world;
+}
+```
+
+### The chamber walls
+
+All walls are colliders on one fixed body. The testbed's walls were zero-thickness edges; here the
+side and top walls are boxes 2 units thick whose inner faces lie exactly on those edges, because a
+packed colony can push a cell through an infinitely thin wall but not through a thick one. For a
+vertical edge the box extends outwards, away from the chamber; the top wall's box also reaches past
+both corners, so that no gap remains there.
+
+The wall triangles are added as they are listed in [the chamber data](model.qmd#the-chamber-geometry),
+with one correction: Rapier needs their vertices in counter-clockwise order, and lets cells pass
+straight through a clockwise triangle. The left and top triangles are listed clockwise (Box2D
+reordered them silently), so their vertices are swapped when the sign of the cross product shows
+it.
+
+Like the cells' friction (below), the walls' friction is stored as a square root and combined by
+multiplication.
+
+```{.typescript #sim-create-walls}
+private createWalls(): void {
+  const walls = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
+  const add = (desc: ColliderDesc) => this.world.createCollider(desc
+    .setFriction(Math.sqrt(CHAMBER.friction))
+    .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Multiply)
+    .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max), walls);
+  for (const [v1, v2] of CHAMBER.edges) {
+    const cx = (v1.x + v2.x) / 2, cy = (v1.y + v2.y) / 2;
+    const hx = Math.abs(v1.x - v2.x) / 2, hy = Math.abs(v1.y - v2.y) / 2;
+    const t = WALL_THICKNESS / 2;
+    if (hx === 0) {
+      add(RAPIER.ColliderDesc.cuboid(t, hy).setTranslation(cx + Math.sign(cx) * t, cy));
+    } else {
+      add(RAPIER.ColliderDesc.cuboid(hx + 2 * t, t).setTranslation(cx, cy + t));
+    }
+  }
+  for (const tri of CHAMBER.triangles) {
+    const [a, b, c] = tri.vertices.map((v) => ({ x: v.x + tri.offset.x, y: v.y + tri.offset.y }));
+    const clockwise = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y) < 0;
+    add(clockwise ? RAPIER.ColliderDesc.triangle(a, c, b) : RAPIER.ColliderDesc.triangle(a, b, c));
+  }
+}
+```
+
+## Cells
+
+### Creating a cell
+
+A new cell draws two random numbers, in the testbed's order: its friction coefficient and its
+reproductive length. Its mass and moment of inertia come from the
+[Box2D formulas](model.qmd#mass-and-moment-of-inertia) and are set directly on the body (the
+collider gets density 0, so that Rapier does not add mass of its own). Bodies never sleep: a
+resting cell must still notice when its neighbours grow.
+
+**Friction.** Box2D combines the friction coefficients of two touching shapes as the geometric
+mean, $\sqrt{f_1 f_2}$. Rapier has no such rule, but it can multiply. So each collider stores
+$\sqrt{f}$, and the *Multiply* rule gives $\sqrt{f_1}\sqrt{f_2} = \sqrt{f_1 f_2}$, exactly Box2D's
+value.
+
+Each new cell gets the next id, and its parent is recorded in the lineage (0 for the initial
+cells).
+
+```{.typescript #sim-create-cell}
+private createCell(x: number, y: number, angle: number, length: number, color: RGB, parentId: number, phase: number): Cell {
+  const p = this.params;
+  const friction = this.rng();
+  const reproductiveLength = p.reproductiveLengthMean + (this.rng() - 0.5) * p.reproductiveLengthSpread;
+  const { mass, inertia } = cellMassProperties(length, p.radius, p.density);
+  const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic()
+    .setTranslation(x, y)
+    .setRotation(angle)
+    .setCanSleep(false)
+    .setLinearDamping(this.linearDamping(mass))
+    .setAngularDamping(this.angularDamping(inertia))
+    .setAdditionalMassProperties(mass, this.zero, inertia));
+  const sqrtFriction = Math.sqrt(friction);
+  const collider = this.world.createCollider(this.cellColliderDesc(length, sqrtFriction), body);
+  const id = this.nextId++;
+  this.states.addLineage(id, parentId);
+  return {
+    id, body, collider, sqrtFriction, flipped: false, mass, inertia, length, color, reproductiveLength,
+    growthRate: 1 + p.rate, phase, anchors: [], removed: false,
+  };
+}
+```
+
+The collider is a capsule along the body's local $y$ axis, with half-height $\ell/2$ (the distance
+from the centre to each end cap's centre) and the cell's radius. Restitution is 0, and combined with
+the *Max* rule, as in Box2D.
+
+```{.typescript #sim-collider-desc}
+private cellColliderDesc(length: number, sqrtFriction: number): ColliderDesc {
+  const p = this.params;
+  return RAPIER.ColliderDesc.capsule(length / 2, p.radius)
+    .setDensity(0)
+    .setFriction(sqrtFriction)
+    .setFrictionCombineRule(RAPIER.CoefficientCombineRule.Multiply)
+    .setRestitution(p.restitution)
+    .setRestitutionCombineRule(RAPIER.CoefficientCombineRule.Max);
+}
+```
+
+### Drag as damping
+
+With continuous drag, a cell's drag is its body's linear and angular damping, at the
+[rates derived in the model](model.qmd#drag-formulas). With the testbed's kick instead
+(`continuousDrag` = 0), the bodies get no damping, and the kick is applied on growth steps.
+
+```{.typescript #sim-damping}
+private linearDamping(mass: number): number {
+  const p = this.params;
+  return p.continuousDrag !== 0 ? continuousDampingRate(p.airResistance, mass, p.growthInterval) : 0;
+}
+
+private angularDamping(inertia: number): number {
+  const p = this.params;
+  return p.continuousDrag !== 0 ? continuousDampingRate(p.angularAirResistance, inertia, p.growthInterval) : 0;
+}
+```
+
+## Growth, division and removal
+
+`growDivideAndMark` handles the cells of one growth group: it grows them, divides those that are
+long enough, marks those that left the chamber or died, and updates the cells in the wall zones. It
+returns whether any cell was marked for removal.
+
+Cells are only *marked* here and removed afterwards, so that the array is not modified while it is
+being walked. Daughters are appended to the end of the array; the loop stops at the length the
+array had when it started, so a newborn cell is first handled on its group's next turn.
+
+```{.typescript #sim-grow-divide-mark}
+private growDivideAndMark(phase: number): boolean {
+  const p = this.params;
+  const dt = 1 / p.hertz;
+  const kick = p.continuousDrag === 0;
+  let marked = false;
+  const count = this.cells.length;
+  for (let i = 0; i < count; i++) {
+    const cell = this.cells[i];
+    if (cell.phase !== phase) { continue; }
+    const body = cell.body;
+
+    <<sim-grow>>
+
+    <<sim-drag-kick>>
+
+    <<sim-divide>>
+
+    <<sim-leave-or-die>>
+
+    <<sim-wall-zone>>
+  }
+  return marked;
+}
+```
+
+### Growth
+
+A cell grows along its long axis by its growth rate, and its collider is replaced or resized to
+match ([Growing a collider](#growing-a-collider) explains why this is less simple than it sounds).
+
+```{.typescript #sim-grow}
+cell.length *= cell.growthRate;
+this.resizeCollider(cell);
+```
+
+### The drag kick
+
+Only with `continuousDrag` = 0: the testbed's drag. Box2D applied the force $-k v$ once per fixture
+and let it act during the next step; here the same change of velocity is applied at once, as an
+impulse $-f\,m\,v$ (and $-f\,I\,\omega$ for the spin), with the fraction $f$ from
+[`dragFraction`](model.qmd#drag-formulas).
+
+```{.typescript #sim-drag-kick}
+if (kick) {
+  const v = body.linvel();
+  const linear = -dragFraction(p.airResistance, cell.mass, dt, p.dragClamp !== 0) * cell.mass;
+  body.applyImpulse({ x: linear * v.x, y: linear * v.y }, true);
+  body.applyTorqueImpulse(-dragFraction(p.angularAirResistance, cell.inertia, dt, p.dragClamp !== 0) * cell.inertia * body.angvel(), true);
+}
+```
+
+### Division
+
+A cell that has reached its reproductive length divides into two daughters lying along the
+parent's axis. Of the parent's straight middle section, $\ell - 2a$, a share $p$ goes to daughter A
+and $1-p$ to daughter B:
+
+$$
+\ell_A = (\ell - 2a)\,p, \qquad \ell_B = (\ell - 2a)(1 - p).
+$$
+
+Their tip-to-tip lengths, $\ell_A + 2a$ and $\ell_B + 2a$, add up to the parent's $\ell + 2a$.
+With centred division each daughter sits flush with one end of the parent, so its centre is at a
+distance $\ell/2 - \ell_A/2$ (or $\ell/2 - \ell_B/2$) from the parent's centre. The testbed's
+placement, kept for `centredDivision` = 0, is slightly off, which made one daughter overlap the
+parent's neighbour.
+
+The long axis points along $(-\sin\theta, \cos\theta)$. The daughter of length $\ell_A$ goes
+backwards along it and the daughter of length $\ell_B$ forwards. The first daughter takes over the
+parent's body and collider, with a new id and the state of a newborn cell; the second is a new
+body. Anchors holding the parent let go, since the parent no longer exists.
+
+```{.typescript #sim-divide}
+const length = cell.length;
+const position = body.translation();
+const angle = body.rotation();
+let divided = false;
+
+if (length >= cell.reproductiveLength) {
+  const a = p.radius;
+  const proportion = p.reproductionProportionMin + this.rng() * p.reproductionProportionRange;
+  const lengthA = (length - (2 * a)) * proportion;
+  const lengthB = (length - (2 * a)) * (1 - proportion);
+  const factorA = p.centredDivision ? length / 2 - lengthB / 2 : proportion * (1 / 2) * length + (a / 2);
+  const factorB = p.centredDivision ? length / 2 - lengthA / 2 : (1 - proportion) * (1 / 2) * length + (a / 2);
+  const sin = Math.sin(angle), cos = Math.cos(angle);
+  const x1 = position.x + factorB * sin, y1 = position.y - factorB * cos;
+  const x2 = position.x - factorA * sin, y2 = position.y + factorA * cos;
+
+  const color = cell.color;
+  const parentId = cell.id;
+  this.detachAnchors(cell, true);
+  this.resetCell(cell, x1, y1, angle, lengthA, color, parentId);
+  this.cells.push(this.createCell(x2, y2, angle, lengthB, color, parentId, cell.phase));
+  divided = true;
+}
+```
+
+Reusing the parent's body for the first daughter saves creating and destroying a body at every
+division. `resetCell` turns it into a newborn cell: it draws the same two random numbers as
+`createCell`, in the same order, moves and stops the body, gives it the new mass, damping and
+friction, and refreshes its collider.
+
+```{.typescript #sim-reset-cell}
+private resetCell(cell: Cell, x: number, y: number, angle: number, length: number, color: RGB, parentId: number): void {
+  const p = this.params;
+  const friction = this.rng();
+  cell.reproductiveLength = p.reproductiveLengthMean + (this.rng() - 0.5) * p.reproductiveLengthSpread;
+  const { mass, inertia } = cellMassProperties(length, p.radius, p.density);
+  const body = cell.body;
+  body.setTranslation({ x, y }, true);
+  body.setRotation(angle, true);
+  body.setLinvel(this.zero, true);
+  body.setAngvel(0, true);
+  body.setAdditionalMassProperties(mass, this.zero, inertia, true);
+  if (p.continuousDrag !== 0) {
+    body.setLinearDamping(this.linearDamping(mass));
+    body.setAngularDamping(this.angularDamping(inertia));
+  }
+  cell.mass = mass;
+  cell.inertia = inertia;
+  cell.length = length;
+  cell.sqrtFriction = Math.sqrt(friction);
+  cell.collider.setFriction(cell.sqrtFriction);
+  this.resizeCollider(cell);
+  cell.color = color;
+  cell.growthRate = 1 + p.rate;
+  cell.id = this.nextId++;
+  this.states.addLineage(cell.id, parentId);
+}
+```
+
+### Leaving the chamber, and death
+
+A cell whose centre is outside the chamber's box leaves the simulation. A cell inside dies with a
+small probability. The `||` matters for reproducibility: the random number for death is drawn only
+when the cell is inside, exactly as in the testbed, so the sequence of random numbers, and hence
+the run, stays the same. All checks use the position before division; if the cell divided, its
+daughters stay even when the parent would have left or died.
+
+```{.typescript #sim-leave-or-die}
+if (position.x < p.minX || position.x > p.maxX || position.y < p.minY || position.y > p.maxY || this.rng() < p.randomDeathProbability) {
+  if (!divided) { cell.removed = true; marked = true; }
+}
+```
+
+### Near the walls
+
+A cell within `wallZone` of a side wall turns green and grows at `wallRate`, and may attach to the
+surface. Elsewhere it turns magenta and grows at `rate`. A cell that just divided is left alone:
+`resetCell` has given the first daughter its parent's colour and the default growth rate, and both
+daughters are updated on their group's next turn.
+
+The anchor reproduces another testbed quirk: a cell that divided or was marked for removal in this
+same pass still draws its random number and may create an anchor, but the anchor holds nothing.
+
+```{.typescript #sim-wall-zone}
+if (position.x < p.minX + p.wallZone || position.x > p.maxX - p.wallZone) {
+  if (!divided) {
+    cell.color = COLOR_WALL;
+    cell.growthRate = 1 + p.wallRate;
+  }
+  if (this.rng() < p.anchorProbability) {
+    this.createAnchor(position.x, position.y, divided || cell.removed ? null : cell);
+  }
+} else if (!divided) {
+  cell.color = COLOR_CENTRE;
+  cell.growthRate = 1 + p.rate;
+}
+```
+
+### Removing cells
+
+Marked cells are removed in one pass that compacts the array in place. Removing a body also
+removes its springs, so the anchors only need to forget the cell.
+
+```{.typescript #sim-remove-marked-cells}
+private removeMarkedCells(): void {
+  let kept = 0;
+  for (const cell of this.cells) {
+    if (cell.removed) {
+      this.detachAnchors(cell, false);
+      this.world.removeRigidBody(cell.body);
+    } else {
+      this.cells[kept++] = cell;
+    }
+  }
+  this.cells.length = kept;
+}
+```
+
+## Growing a collider
+
+Growing a cell should be as simple as making its capsule longer, and Rapier offers
+`setHalfHeight` for exactly that. It does not work here, because of how Rapier (version 0.21)
+caches contacts. When two colliders barely move relative to each other, Rapier keeps their contact
+points from the previous step, and changing a collider's shape does not refresh them. A cell at
+rest, as most cells are once the chamber is full, then grows straight into its neighbours and into
+the walls while the contact keeps reporting zero depth. Overlaps rose steadily as the chamber
+filled. `tools/rapier-stale-contacts.mjs` reproduces the bug in a few lines.
+
+`refreshContacts` chooses the remedy:
+
+- **1 (default): replace the collider.** A new collider gets fresh contacts. Rapier leaks some
+  WebAssembly memory for every replaced collider that touches others, though: about 13 MB per 1000
+  steps with a full chamber, enough to exhaust the 4 GB WebAssembly heap after about 230 000 steps.
+  Freeing a whole world returns the memory, so the simulation [rebuilds the world](#rebuilding-the-world)
+  every `rebuildInterval` steps.
+- **2: resize in place, then turn the collider by π.** The capsule is symmetric, so it occupies the
+  same space, but the turn makes Rapier recompute most of its contacts, without allocating.
+  Contacts between two cells that both turned are sometimes missed, and overlaps were worse.
+- **0: resize in place only**, with stale contacts, to show the effect.
+
+```{.typescript #sim-resize-collider}
+private resizeCollider(cell: Cell): void {
+  switch (this.params.refreshContacts) {
+    case 1:
+      this.world.removeCollider(cell.collider, false);
+      cell.collider = this.world.createCollider(this.cellColliderDesc(cell.length, cell.sqrtFriction), cell.body);
+      break;
+    case 2:
+      cell.collider.setHalfHeight(cell.length / 2);
+      cell.flipped = !cell.flipped;
+      cell.collider.setRotationWrtParent(cell.flipped ? Math.PI : 0);
+      break;
+    default:
+      cell.collider.setHalfHeight(cell.length / 2);
+  }
+}
+```
+
+### Rebuilding the world
+
+A rebuild moves everything into a fresh world and frees the old one. Every cell gets a new body
+with exactly its old position, angle, velocities, mass and damping, and a new collider; the walls
+and the anchors' fixed bodies and springs are recreated. Contacts start fresh, just as they do
+after any collider replacement, so the simulation carries on as if nothing had happened, and the
+memory Rapier leaked is returned.
+
+```{.typescript #sim-rebuild-world}
+private rebuildWorld(): void {
+  const old = this.world;
+  this.world = this.createWorld();
+  for (const cell of this.cells) {
+    const t = cell.body.translation(), v = cell.body.linvel();
+    const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.dynamic()
+      .setTranslation(t.x, t.y)
+      .setRotation(cell.body.rotation())
+      .setLinvel(v.x, v.y)
+      .setAngvel(cell.body.angvel())
+      .setCanSleep(false)
+      .setLinearDamping(this.linearDamping(cell.mass))
+      .setAngularDamping(this.angularDamping(cell.inertia))
+      .setAdditionalMassProperties(cell.mass, this.zero, cell.inertia));
+    cell.body = body;
+    cell.collider = this.world.createCollider(this.cellColliderDesc(cell.length, cell.sqrtFriction)
+      .setRotation(cell.flipped ? Math.PI : 0), body);
+  }
+  this.createWalls();
+  for (const anchor of this.anchors) {
+    anchor.body = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(anchor.x, anchor.y));
+    if (anchor.cell) {
+      const data = RAPIER.JointData.spring(0, anchor.stiffness, anchor.damping, this.zero, this.zero);
+      anchor.joint = this.world.createImpulseJoint(data, anchor.cell.body, anchor.body, true);
+    }
+  }
+  old.free();
+}
+```
+
+## Anchors
+
+An anchor is a fixed body at the attachment point and a spring of rest length zero between it and
+the cell's centre. The spring constants are Box2D's for a body held by a static one: for a cell of
+mass $m$, natural frequency $\nu$ (`anchorFrequencyHz`) and damping ratio $\zeta$,
+
+$$
+\omega = 2\pi\nu, \qquad k = m\,\omega^2, \qquad c = 2\,m\,\zeta\,\omega .
+$$
+
+Rapier's spring joint applies these as forces; with $\nu = 0.8$ Hz a held cell swings with a period
+of 1.25 s. An anchor created without a cell (see [Near the walls](#near-the-walls)) is just a fixed
+point.
+
+```{.typescript #sim-create-anchor}
+private createAnchor(x: number, y: number, cell: Cell | null): void {
+  const p = this.params;
+  const body = this.world.createRigidBody(RAPIER.RigidBodyDesc.fixed().setTranslation(x, y));
+  const anchor: Anchor = { body, x, y, createdAtStep: this.stepCount, cell, joint: null, stiffness: 0, damping: 0 };
+  if (cell) {
+    const mass = cell.body.mass();
+    const omega = 2 * Math.PI * p.anchorFrequencyHz;
+    anchor.stiffness = mass * omega * omega;
+    anchor.damping = 2 * mass * p.anchorDampingRatio * omega;
+    const data = RAPIER.JointData.spring(0, anchor.stiffness, anchor.damping, this.zero, this.zero);
+    anchor.joint = this.world.createImpulseJoint(data, cell.body, body, true);
+    cell.anchors.push(anchor);
+  }
+  this.anchors.push(anchor);
+}
+```
+
+When a cell divides or is removed, its anchors stop holding it. On division the springs are removed
+explicitly; on removal there is no need, since removing the cell's body removes its springs too.
+
+```{.typescript #sim-detach-anchors}
+private detachAnchors(cell: Cell, removeJoints: boolean): void {
+  for (const anchor of cell.anchors) {
+    if (removeJoints && anchor.joint) { this.world.removeImpulseJoint(anchor.joint, true); }
+    anchor.joint = null;
+    anchor.cell = null;
+  }
+  cell.anchors.length = 0;
+}
+```
+
+Once per growth cycle, anchors that have expired, or whose cell has been dragged more than
+`anchorMaxStretch` away, are removed. Removing an anchor's fixed body removes its spring.
+
+```{.typescript #sim-remove-anchors}
+private removeAnchors(): void {
+  const p = this.params;
+  let kept = 0;
+  for (const anchor of this.anchors) {
+    if (this.stepCount - anchor.createdAtStep >= p.anchorLifetimeSteps || this.overStretched(anchor)) {
+      if (anchor.cell) { anchor.cell.anchors.splice(anchor.cell.anchors.indexOf(anchor), 1); }
+      this.world.removeRigidBody(anchor.body);
+    } else {
+      this.anchors[kept++] = anchor;
+    }
+  }
+  this.anchors.length = kept;
+}
+```
+
+```{.typescript #sim-over-stretched}
+private overStretched(anchor: Anchor): boolean {
+  const max = this.params.anchorMaxStretch;
+  if (max <= 0 || !anchor.cell) { return false; }
+  const t = anchor.cell.body.translation();
+  return Math.hypot(t.x - anchor.x, t.y - anchor.y) > max;
+}
+```
+
+## Snapshots
+
+A snapshot records every cell's centre, id, orientation and length at full precision; the
+[recorder](recording.qmd#recording-states) rounds and stores them.
+
+```{.typescript #sim-take-snapshot}
+private takeSnapshot(): void {
+  const cells: CellState[] = [];
+  for (const cell of this.cells) {
+    const t = cell.body.translation();
+    cells.push({ x: t.x, y: t.y, id: cell.id, an: orientationOf(cell.body.rotation()), le: cell.length });
+  }
+  this.states.addSnapshot(cells);
+}
+```

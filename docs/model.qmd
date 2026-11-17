@@ -1,0 +1,484 @@
+---
+title: "The model"
+subtitle: "`src/model.ts`: parameters, chamber geometry, and the mechanics of a single cell"
+---
+
+This module holds everything about the model that does not depend on the physics engine: every
+tunable parameter with its default, the shape of the chamber, and the formulas that turn a cell's
+size into a mass, a moment of inertia and a drag. The next chapter, [The simulation](simulation.qmd),
+puts these pieces on Rapier.
+
+::: {.callout-note collapse="true"}
+## Where the numbers come from
+
+The model was first written on Box2D, the 2D physics engine behind many games, as a test case in
+Box2D's own "testbed" application. Several values below (the cell mass, how friction coefficients
+mix, the spring constants of the anchors) are Box2D's own formulas, reproduced here so that the
+mechanics stayed the same when the model moved to Rapier. When this site says "the testbed", it
+means that original implementation. The [development notes](NOTES.md) record every change since.
+:::
+
+The module has five parts:
+
+```{.typescript file=src/model.ts}
+<<model-parameters>>
+
+<<model-parameter-type>>
+
+<<model-check-parameters>>
+
+<<model-chamber>>
+
+<<model-cells>>
+```
+
+## Parameters
+
+All parameters live in one plain object. Its type is inferred from the object itself, so adding a
+parameter is a one-line change, and the command line (`--set name=value`), the browser (URL
+parameters) and `Simulation.create()` all accept every parameter by name without further code.
+
+```{.typescript #model-parameters}
+export const DEFAULT_PARAMS = {
+	<<model-params-stepping>>
+
+	<<model-params-chamber>>
+
+	<<model-params-population>>
+
+	<<model-params-growth>>
+
+	<<model-params-drag>>
+
+	<<model-params-anchors>>
+
+	<<model-params-material>>
+
+	<<model-params-output>>
+};
+```
+
+Lengths are in model units: a cell is 0.8 units wide, and the chamber is 100 × 60 units. Time is
+counted in steps; one step is 1/60 of a simulated second.
+
+### Time stepping and the solver
+
+::: {.parameters}
+| Parameter | Default | Meaning |
+|---|---|---|
+| `hertz` | 60 | steps per simulated second; one step lasts 1/`hertz` |
+| `substeps` | 1 | Rapier steps per simulation step, each 1/(`hertz` · `substeps`) long |
+| `solverIterations` | 8 | iterations of Rapier's contact solver (Rapier's default: 4) |
+| `pgsIterations` | 1 | internal iterations per solver iteration (Rapier's default) |
+| `contactFrequency` | 720 | contact stiffness, as a natural frequency in Hz; 0 keeps Rapier's default (30) |
+| `refreshContacts` | 1 | how a growing cell gets fresh contacts: 1 replace its collider, 2 turn it by π, 0 nothing |
+| `rebuildInterval` | 10 000 | with `refreshContacts` = 1, rebuild the Rapier world every this many steps (0 = never) |
+:::
+
+Rapier's defaults are made for games, where a pile of boxes may sink into each other a little. A
+packed colony of 1700 cells pushing towards the exit is much more demanding: with 4 iterations and
+soft (30 Hz) contacts, cells were pressed far into each other once the chamber was full. The solver
+settings were found by measuring the overlap between cells over long runs and sweeping iterations
+and contact stiffness; stiffer contacts cost nothing per step, extra iterations do. The
+[overlap report](reports/overlap-report.md) has the measurements. The last two parameters work
+around a Rapier bug that the next chapter explains in
+[Growing a collider](simulation.qmd#growing-a-collider).
+
+```{.typescript #model-params-stepping}
+hertz: 60,
+substeps: 1,
+solverIterations: 8,
+pgsIterations: 1,
+contactFrequency: 720,
+refreshContacts: 1,
+rebuildInterval: 10000,
+```
+
+### The chamber
+
+The chamber spans $x \in [-50, 50]$ and $y \in [140, 200]$. It is closed on the left, right and top
+and open at the bottom, where it meets the feeding channel. A cell whose centre leaves this box is
+removed: that is how cells exit the chamber.
+
+```{.typescript #model-params-chamber}
+minX: -50, maxX: 50,
+minY: 140, maxY: 200,
+```
+
+### The initial population
+
+A run starts with 1000 cells scattered at random positions and angles. Their initial length is
+$\ell_0 = \ell_\text{min} + 0.2\,U\,(\ell_\text{max} - \ell_\text{min})$, with $U$ uniform in
+$[0, 1)$, so between 2.4 and 2.88. (The factor 0.2 is the testbed's: only the shortest fifth of the
+range is used.) Here and below, a cell's *length* $\ell$ is the distance between the centres of its
+two rounded ends; the tip-to-tip length is $\ell + 2r$. Since the cells are placed without regard
+for each other, they start out heavily overlapping, and the physics engine needs the first ~3000
+steps to push them apart.
+
+```{.typescript #model-params-population}
+initialCells: 1000,
+minSize: 2.4, maxSize: 4.8,
+```
+
+All cell sizes are 0.8 times those of the testbed (whose cells had radius 0.5, initial lengths from
+3 to 6, and divided at 6 ± 1.25).
+
+### Growth, division and death
+
+Every cell grows once per *growth cycle* of `growthInterval` = 25 steps, by a factor
+$1 + \text{rate}$ in length:
+
+$$
+\ell \leftarrow \ell \, (1 + \text{rate}), \qquad \text{rate} = 0.0016 .
+$$
+
+A cell therefore doubles its length in $\ln 2 / \ln 1.0016 \approx 433$ growth events, about
+10 800 steps. Cells within `wallZone` = 20 units of a side wall grow at `wallRate` instead (the same
+value by default, but kept separate so the two regions can be made to differ).
+
+The cells do not all grow on the same step. They are split into `growthGroups` = 5 groups, and the
+groups take turns, one every 5 steps; each cell still grows once per cycle. A newborn cell joins its
+mother's group. In the testbed every cell grew on the same step, and the whole colony was pushed
+outward in one pulse every 25 steps; spreading growth over the cycle removed that visible rhythm.
+One group per step (`growthGroups` = 25) would be smoother still, but Rapier pays a fixed cost on
+every step in which any collider changes (about 2 ms with a full chamber), so 5 groups is the
+compromise. `growthGroups` must divide `growthInterval`.
+
+A cell divides once its length reaches its *reproductive length*, drawn at birth as
+$\ell_\text{div} = 4.8 + (U - \tfrac12) \cdot 2$, i.e. uniformly between 3.8 and 5.8. It splits
+into two daughters of unequal size: a share $p = 0.3 + 0.2\,U$ of the parent's straight middle
+section goes to one daughter and $1 - p$ to the other.
+
+```{.typescript #model-params-growth}
+growthInterval: 25,
+growthGroups: 5,
+rate: 0.002 * 0.8,
+wallRate: 0.002 * 0.8,
+wallZone: 20,
+reproductionProportionMin: 0.3,
+reproductionProportionRange: 0.2,
+reproductiveLengthMean: 4.8,
+reproductiveLengthSpread: 2.0,
+centredDivision: 1,
+randomDeathProbability: 0.001 * 0.15,
+```
+
+`centredDivision` = 1 places the two daughters so that together they fill exactly the parent's
+outline. The testbed (`centredDivision` = 0) shifted both daughters along the axis, so that the tip
+of one of them poked up to 10% of the cell width past the parent's end, into whichever neighbour
+touched it there. The [division code](simulation.qmd#division) shows both placements.
+
+Finally, at each growth event a cell dies with probability `randomDeathProbability`
+($1.5 \times 10^{-4}$) and is removed.
+
+### Drag
+
+Bacteria live where viscosity dominates: they stop as soon as nothing pushes them. A physics
+engine, in contrast, conserves momentum, and without drag the colony would stream out of the
+chamber. The model therefore damps every cell's velocity and spin.
+
+::: {.parameters}
+| Parameter | Default | Meaning |
+|---|---|---|
+| `airResistance` | 0.007 · 0.8² | linear drag coefficient $k$ (force = $-k\,v$) |
+| `angularAirResistance` | 0.007 · 0.8⁴ | the same for rotation |
+| `continuousDrag` | 1 | 1: drag acts every step, as body damping; 0: the testbed's kick on growth steps |
+| `dragClamp` | 1 | with `continuousDrag` = 0, a kick removes at most all of a cell's velocity |
+:::
+
+```{.typescript #model-params-drag}
+airResistance: 0.007 * 0.8 ** 2,
+angularAirResistance: 0.007 * 0.8 ** 4,
+continuousDrag: 1,
+dragClamp: 1,
+```
+
+The coefficients are the testbed's (0.007), scaled with the cell size so that drag still removes
+the same *fraction* of a cell's velocity: mass scales with area ($0.8^2$) and the moment of inertia
+with mass times length squared ($0.8^4$).
+
+The testbed applied drag as a single kick on growth steps. Each kick removed 50–100% of a cell's
+velocity at once and nothing slowed the cells in between, so the colony moved in a stop-and-go
+rhythm. With `continuousDrag` = 1 the same average drag is applied smoothly, by the physics engine,
+on every step; the [formulas](#drag-formulas) are below. `dragClamp` only matters for the old
+kick: for cells shorter than about 1.4, a kick removed *more* than all of their spin, reversing it
+and amplifying it, so small isolated cells spun up like propellers. The clamp caps the kick at
+stopping the cell.
+
+### Anchoring to the surface
+
+Cells near the side walls can attach to the chamber floor, as bacteria do with extracellular
+matrix. In the model an *anchor* is a zero-length spring between the cell's centre and a fixed
+point where the cell was when it attached.
+
+::: {.parameters}
+| Parameter | Default | Meaning |
+|---|---|---|
+| `anchorProbability` | 0.001 | chance per growth event that a cell in a wall zone attaches |
+| `anchorFrequencyHz` | 0.8 | natural frequency of the spring |
+| `anchorDampingRatio` | 0.3 | damping ratio of the spring |
+| `anchorLifetimeSteps` | 12 000 | the anchor is removed after this many steps |
+| `anchorMaxStretch` | 4 | the anchor lets go when its cell is farther than this from the anchor point (0 = never) |
+:::
+
+```{.typescript #model-params-anchors}
+anchorProbability: 0.001,
+anchorFrequencyHz: 0.8,
+anchorDampingRatio: 0.3,
+anchorLifetimeSteps: 12000,
+anchorMaxStretch: 4,
+```
+
+The testbed removed anchors after 200 seconds of *wall-clock* time; 12 000 steps is 200 s at 60
+steps per second. Its anchors also never let go otherwise. The 0.8 Hz springs are too soft to hold
+a cell against a packed colony, so once the chamber was full the colony dragged anchored cells
+several units away, and the stretched springs pulled them back hard enough to push them into their
+neighbours. Letting go beyond a maximum stretch, like matrix that yields under strain, removed
+those deep overlaps in the validation runs, which used a limit of 2 units; the default is now 4
+units, five cell widths.
+
+### Cell shape and material
+
+A cell is a *capsule*: a rectangle with a half disc at each end, `radius` = 0.4 (so the cell is
+0.8 wide). Collisions are perfectly inelastic (`restitution` = 0). Each cell gets its own friction
+coefficient, uniform in $[0, 1)$, when it is born; it is not a parameter.
+
+```{.typescript #model-params-material}
+radius: 0.4,
+density: 0.0001,
+restitution: 0.0,
+```
+
+### Output
+
+The positions of all cells are recorded every `snapshotInterval` steps
+([Randomness and records](recording.qmd) describes the format).
+
+```{.typescript #model-params-output}
+snapshotInterval: 300,
+```
+
+### The parameter type
+
+A run is described by the parameters plus a random seed. The type is derived from the defaults,
+so it can never fall out of step with them.
+
+```{.typescript #model-parameter-type}
+export type SimulationParams = typeof DEFAULT_PARAMS & { seed: number };
+```
+
+### Checking parameters
+
+Most parameters accept any number, but four are counts that the stepping logic relies on, so they
+are checked when a simulation is created, and a bad value stops it with a clear message:
+
+- `growthInterval` and `growthGroups` must be positive integers, and the groups must divide the
+  cycle evenly; otherwise some groups would never get a turn to grow.
+- `snapshotInterval` must be a multiple of `growthInterval`, so that every snapshot is taken at the
+  same point of the growth cycle. (In the testbed, which only looked for snapshots on growth steps,
+  other values silently skipped snapshots.)
+- `substeps` must be a positive integer.
+
+```{.typescript #model-check-parameters}
+export function checkParams(p: SimulationParams): void {
+	if (!Number.isInteger(p.growthInterval) || p.growthInterval < 1) {
+		throw new Error(`growthInterval must be a positive integer (got ${p.growthInterval})`);
+	}
+	if (!Number.isInteger(p.snapshotInterval) || p.snapshotInterval < 1 || p.snapshotInterval % p.growthInterval !== 0) {
+		throw new Error(`snapshotInterval must be a positive multiple of growthInterval (${p.growthInterval}); got ${p.snapshotInterval}`);
+	}
+	if (!Number.isInteger(p.growthGroups) || p.growthGroups < 1 || p.growthInterval % p.growthGroups !== 0) {
+		throw new Error(`growthGroups must be a positive integer that divides growthInterval (${p.growthInterval}); got ${p.growthGroups}`);
+	}
+	if (!Number.isInteger(p.substeps) || p.substeps < 1) {
+		throw new Error(`substeps must be a positive integer (got ${p.substeps})`);
+	}
+}
+```
+
+## The chamber geometry
+
+The chamber is described as data, so that the physics ([walls](simulation.qmd#the-chamber-walls)),
+the overlap check and the drawing all use the same shapes:
+
+- three straight walls: the top wall, and the two side walls, open at the bottom;
+- rows of small triangles along the walls, each sticking one unit into the chamber: 12 on each side
+  wall, every 5 units, and 20 along the top.
+
+```{.typescript #model-chamber}
+<<model-geometry-types>>
+
+<<model-triangle-rows>>
+
+<<model-wall-triangles>>
+
+<<model-chamber-data>>
+```
+
+A point is a plain pair of coordinates. A triangle is stored as three vertices plus an offset, the
+way the testbed created them: one triangle shape, repeated at regular offsets.
+
+```{.typescript #model-geometry-types}
+export interface Point { x: number; y: number; }
+
+export interface Triangle { offset: Point; vertices: [Point, Point, Point]; }
+```
+
+`triangleRows` repeats one or more triangle shapes `count` times, shifting the $i$-th copy by
+$i \cdot \text{step}$:
+
+```{.typescript #model-triangle-rows}
+function triangleRows(count: number, step: Point, ...vertexSets: [Point, Point, Point][]): Triangle[] {
+	const rows: Triangle[] = [];
+	for (let i = 0; i < count; i++) {
+		for (const vertices of vertexSets) { rows.push({ offset: { x: i * step.x, y: i * step.y }, vertices }); }
+	}
+	return rows;
+}
+```
+
+The three triangle shapes sit at the bottom of each side wall and at the left end of the top wall.
+Each has two vertices on the wall and a third one unit inside the chamber.
+
+```{.typescript #model-wall-triangles}
+const RIGHT_WALL_TRIANGLE: [Point, Point, Point] = [{ x: 50, y: 140 }, { x: 50, y: 142 }, { x: 49, y: 141 }];
+const LEFT_WALL_TRIANGLE: [Point, Point, Point] = [{ x: -50, y: 140 }, { x: -50, y: 142 }, { x: -49, y: 141 }];
+const TOP_WALL_TRIANGLE: [Point, Point, Point] = [{ x: -50, y: 200 }, { x: -48, y: 200 }, { x: -49, y: 199 }];
+```
+
+The chamber lists the triangles first and then the walls, in the order the testbed created them,
+together with the walls' friction coefficient (Box2D's default, 0.2).
+
+```{.typescript #model-chamber-data}
+export const CHAMBER = {
+	triangles: [
+		...triangleRows(12, { x: 0, y: 5 }, RIGHT_WALL_TRIANGLE, LEFT_WALL_TRIANGLE),
+		...triangleRows(20, { x: 5, y: 0 }, TOP_WALL_TRIANGLE),
+	],
+	edges: [
+		[{ x: -50, y: 200 }, { x: 50, y: 200 }],
+		[{ x: 50, y: 200 }, { x: 50, y: 140 }],
+		[{ x: -50, y: 200 }, { x: -50, y: 140 }],
+	] as [Point, Point][],
+	friction: 0.2,
+};
+```
+
+## Cells
+
+The rest of the module is about individual cells: their colours, and the formulas for drag and
+mass.
+
+```{.typescript #model-cells}
+<<model-colours>>
+
+<<model-drag>>
+
+<<model-mass>>
+
+<<model-orientation>>
+```
+
+### Colours
+
+Cells are coloured by where they are: dark grey when they are first placed, green in the wall
+zones and magenta in the centre. The colour is part of the cell's state: it is updated on growth
+steps, when the cell's region is checked, and daughters inherit it. The drawing code uses it to
+tell the regions apart.
+
+```{.typescript #model-colours}
+export interface RGB { r: number; g: number; b: number; }
+export const COLOR_INITIAL: RGB = { r: 0.3, g: 0.35, b: 0.3 };
+export const COLOR_WALL: RGB = { r: 0.1, g: 0.8, b: 0.18 };
+export const COLOR_CENTRE: RGB = { r: 0.8, g: 0.1, b: 0.6 };
+```
+
+### Drag formulas {#drag-formulas}
+
+In the testbed a cell was a Box2D body made of three *fixtures*: a box and two discs. Drag was a
+force $-k\,v$ applied to each fixture, so three times per cell, during one step $\Delta t$ every
+growth cycle.
+
+```{.typescript #model-drag}
+export const DRAG_APPLICATIONS_PER_CELL = 3;
+
+<<model-drag-fraction>>
+
+<<model-damping-rate>>
+```
+
+**The kick.** One kick changes the velocity by $\Delta v = -3 k v \, \Delta t / m$, so it removes
+the fraction
+
+$$
+f = \frac{3\,k\,\Delta t}{m}
+$$
+
+of the velocity (and likewise of the spin, with the moment of inertia $I$ in place of $m$). For a
+very small cell $f$ can exceed 1, which reverses the motion; with the clamp, $f$ is at most 1.
+
+```{.typescript #model-drag-fraction}
+export function dragFraction(coefficient: number, massOrInertia: number, dt: number, clamp: boolean): number {
+	const fraction = DRAG_APPLICATIONS_PER_CELL * coefficient * dt / massOrInertia;
+	return clamp && fraction > 1 ? 1 : fraction;
+}
+```
+
+**Continuous drag.** The kick delivers an impulse $3 k v \,\Delta t$ once every `growthInterval`
+($G$) steps. Spread evenly over those $G$ steps, that is a force of $3 k v / G$, i.e. a damping
+rate
+
+$$
+\gamma = \frac{3\,k}{G\,m} \quad [\text{s}^{-1}] .
+$$
+
+Rapier, like Box2D, applies a body's damping rate every step as
+$v \leftarrow v / (1 + \Delta t\,\gamma)$. Since a cell's mass never changes (see below), the rate
+is set once when the cell is born and costs nothing per step.
+
+```{.typescript #model-damping-rate}
+export function continuousDampingRate(coefficient: number, massOrInertia: number, growthInterval: number): number {
+	return DRAG_APPLICATIONS_PER_CELL * coefficient / (growthInterval * massOrInertia);
+}
+```
+
+### Mass and moment of inertia
+
+The mass and moment of inertia are computed exactly as Box2D computed them for the testbed's cell:
+a box of half-widths $a = r$ and $b = \ell/2$, plus a full disc of radius $a$ at each end. The half
+discs that overlap the box are counted twice, as Box2D did. With density $\rho$:
+
+$$
+\begin{aligned}
+m_\text{box} &= 4 \rho a b, & I_\text{box} &= m_\text{box} \frac{(2a)^2 + (2b)^2}{12}, \\
+m_\text{cap} &= \rho \pi a^2, & I_\text{cap} &= m_\text{cap} \left(\tfrac12 a^2 + b^2\right), \\
+m &= m_\text{box} + 2 m_\text{cap}, & I &= I_\text{box} + 2 I_\text{cap},
+\end{aligned}
+$$
+
+where $I_\text{cap}$ is a disc's own moment plus the parallel-axis term for its distance $b$ from
+the centre. Box2D computed these once, when a cell was created, and never again as the cell grew.
+The model keeps that: a cell's mass is fixed at birth.
+
+```{.typescript #model-mass}
+export function cellMassProperties(length: number, radius: number, density: number): { mass: number, inertia: number } {
+	const a = radius, b = length / 2;
+	const boxMass = density * 4 * a * b;
+	const capMass = density * Math.PI * a * a;
+	const boxInertia = boxMass * ((2 * a) ** 2 + (2 * b) ** 2) / 12;
+	const capInertia = capMass * (0.5 * a * a + b * b);
+	return { mass: boxMass + 2 * capMass, inertia: boxInertia + 2 * capInertia };
+}
+```
+
+### Orientation
+
+The recorded orientation of a cell is its angle as a fraction of $\pi$, folded into $[0, 1]$: a rod
+looks the same when turned by half a turn, so angles $\theta$ and $\theta + \pi$ are the same
+orientation. An orientation of 0 means the cell lies along the $y$ axis, pointing at the exit.
+
+```{.typescript #model-orientation}
+export function orientationOf(angle: number): number {
+	return angle > 0 ? (angle / Math.PI) % 1 : 1 + (angle / Math.PI) % 1;
+}
+```

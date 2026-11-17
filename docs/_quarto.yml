@@ -1,0 +1,79 @@
+project:
+  type: website
+  output-dir: _site
+  render:
+    - "*.qmd"
+    - NOTES.md
+    - reports/overlap-report.md
+
+website:
+  title: "Rapier for bacteria"
+  description: "A literate program: rod-shaped bacteria growing in a microfluidic chamber, simulated with the Rapier physics engine."
+  site-url: https://critalmediumblue.github.io/Rapier-for-bacteria/
+  repo-url: https://github.com/CritalMediumBlue/Rapier-for-bacteria
+  repo-subdir: docs
+  repo-branch: main
+  repo-actions: [source, issue]
+  page-navigation: true
+  search: true
+  navbar:
+    left:
+      - href: index.qmd
+        text: Overview
+      - href: simulation/index.html
+        text: Run the simulation
+        icon: play-circle
+    right:
+      - icon: github
+        href: https://github.com/CritalMediumBlue/Rapier-for-bacteria
+        aria-label: GitHub
+  sidebar:
+    style: docked
+    contents:
+      - index.qmd
+      - section: "The model"
+        contents:
+          - model.qmd
+          - simulation.qmd
+      - section: "Supporting modules"
+        contents:
+          - recording.qmd
+          - overlap.qmd
+      - section: "Running it"
+        contents:
+          - cli.qmd
+          - browser.qmd
+          - rendering.qmd
+      - section: "Background"
+        contents:
+          - NOTES.md
+          - reports/overlap-report.md
+  page-footer:
+    left: "Rapier for bacteria · MIT license"
+    right: "Written as a literate program with [Quarto](https://quarto.org) and [Entangled](https://entangled.github.io)"
+
+filters:
+  - path: filters/literate.lua
+    at: pre-ast
+
+format:
+  html:
+    theme:
+      light: [cosmo, styles.scss]
+      dark: [darkly, styles.scss]
+    highlight-style:
+      light: github
+      dark: github-dark
+    code-copy: true
+    code-overflow: scroll
+    toc: true
+    toc-depth: 3
+    toc-title: "On this page"
+    mermaid:
+      theme: neutral
+    include-in-header:
+      text: |
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    include-after-body: assets/literate.html

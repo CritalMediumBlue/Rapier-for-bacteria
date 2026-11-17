@@ -1,4 +1,7 @@
-# Overlap report: Rapier port
+---
+title: "Overlap validation"
+subtitle: "How deep cells press into each other over long runs, setting by setting"
+---
 
 **Summary.** The final defaults (14 November) are continuous drag, growth spread over 5 groups
 per cycle, anchors that let go at 2 units of stretch, and 8 solver iterations. With them, the
@@ -6,7 +9,7 @@ deepest cell–cell penetration stayed below **8%** of the cell width at every s
 3-seed × 120 000-step validation (worst 7.3%; 2 of 1173 snapshots above the original 5% target).
 A typical full-chamber snapshot (~1740 cells) has its deepest pair at ~0.9% of the width and a
 mean of 0.07%. You relaxed the target from 5% to about 8% in exchange for speed: 8 iterations
-instead of 12 make a step ~19% faster than before these changes (NOTES.md, "Performance"). With 12
+instead of 12 make a step ~19% faster than before these changes ([development notes](../NOTES.md#performance)). With 12
 iterations the same model stays below 5% everywhere (worst 4.9%). With fewer than 8 iterations
 single pairs exceed 8% (worst 10–21% at 5–6 iterations).
 In the 600 000-step run with the final defaults, 1 of 1991 snapshots went over 8% (9.1%, a single
@@ -178,7 +181,7 @@ follow different trajectories after the first rebuild (step 10 000) and the even
 contact and spring caches starting cold (positions, angles, velocities, masses and springs are
 carried over exactly). It does not cause exceptions on its own: the `anchorMaxStretch` runs also
 rebuild every 10 000 steps and had none in 2346 snapshots. Running without rebuilds is not an
-option for long runs (memory; see NOTES.md).
+option for long runs (memory; see the [development notes](../NOTES.md)).
 
 The Box2D port is far from the target: its random start leaves pairs crossed through each other
 for the whole run (it never separates them), and once the chamber fills its packing is denser

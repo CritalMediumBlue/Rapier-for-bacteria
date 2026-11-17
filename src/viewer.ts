@@ -1,29 +1,12 @@
-/**
- * Browser viewer: runs the simulation, draws it (render.ts), measures overlaps, and saves states.
- *
- * URL parameters (all optional): seed=N, style=simple|diagnostic, speed=steps per frame,
- * view=minX,minY,maxX,maxY (zoom into a world area, e.g. view=-50,185,-35,200 for the top-left
- * corner), and any simulation parameter by name (e.g. snapshotInterval=600).
- *
- * Saving ("J" or the button): in Chrome/Edge you pick a file once; it is written immediately and
- * overwritten automatically every AUTO_SAVE_EVERY_SNAPSHOTS snapshots. Without a picked file
- * (or in browsers without the picker), auto-save downloads numbered copies instead.
- *
- * For scripting (e.g. from a headless browser): window.biofilm exposes the simulation, the latest
- * overlap stats, timing, and download().
- */
-
 import { DEFAULT_PARAMS, SimulationParams } from "./model.js";
 import { OVERLAP_TARGET_FRACTION, OVERLAP_WARMUP_STEPS, OverlapMeter, OverlapStats } from "./overlap.js";
 import { ChamberRenderer, RENDER_STYLES, RenderStyle, ViewRect } from "./render.js";
 import { Simulation, rapierVersion } from "./simulation.js";
 
 const AUTO_SAVE_EVERY_SNAPSHOTS = 500;
-/** Diagnostic view: overlaps deeper than this fraction of the cell width are highlighted. */
 const OVERLAP_VISIBLE_FRACTION = 0.01;
 const STATES_FILE_NAME = "states.json";
 
-/** Minimal typing for the File System Access API (Chrome/Edge). */
 interface WritableFileHandle {
   name: string;
   createWritable(): Promise<{ write(data: Blob): Promise<void>, close(): Promise<void> }>;
@@ -39,8 +22,6 @@ const speedInput = $<HTMLInputElement>("speed");
 const seedInput = $<HTMLInputElement>("seed");
 const styleSelect = $<HTMLSelectElement>("style");
 const snapshotInput = $<HTMLInputElement>("snapshotInterval");
-
-// ---------------------------------------------------------------- settings from the URL
 
 const query = new URLSearchParams(location.search);
 const urlOverrides: Partial<SimulationParams> = {};
@@ -58,8 +39,6 @@ const viewParts = (query.get("view") ?? "").split(",").map(Number);
 let view: ViewRect | undefined = viewParts.length === 4 && viewParts.every(Number.isFinite) && viewParts[0] < viewParts[2] && viewParts[1] < viewParts[3]
   ? { minX: viewParts[0], minY: viewParts[1], maxX: viewParts[2], maxY: viewParts[3] } : undefined;
 
-// ---------------------------------------------------------------- state
-
 let sim: Simulation | null = null;
 let paused = false;
 let saveHandle: WritableFileHandle | null = null;
@@ -70,7 +49,7 @@ let stepsPerSecond = 0, framesPerSecond = 0, stepMsPerFrame = 0, drawMsPerFrame 
 const meter = new OverlapMeter();
 let lastOverlap: OverlapStats | null = null;
 const pairs = { i: new Int32Array(4096), j: new Int32Array(4096), depth: new Float64Array(4096), count: 0 };
-let pairsStep = -1; // step the pairs were measured at (re-measured only when the simulation moved)
+let pairsStep = -1;
 
 async function startSimulation(): Promise<void> {
   const seedText = seedInput.value.trim();
@@ -87,8 +66,6 @@ async function startSimulation(): Promise<void> {
   pairsStep = -1;
   console.log(`Simulation started: Rapier ${rapierVersion()}, seed ${sim.params.seed}`);
 }
-
-// ---------------------------------------------------------------- simulation loop
 
 function advance(steps: number): void {
   if (!sim) { return; }
@@ -122,7 +99,7 @@ function frame(): void {
   rateStepMs += t1 - t0;
   rateDrawMs += t2 - t1;
   rateFrames++;
-  if (t2 - rateTime >= 1000) { // averages over the last second
+  if (t2 - rateTime >= 1000) {
     stepsPerSecond = (rateSteps * 1000) / (t2 - rateTime);
     framesPerSecond = (rateFrames * 1000) / (t2 - rateTime);
     stepMsPerFrame = rateStepMs / rateFrames;
@@ -132,8 +109,6 @@ function frame(): void {
   }
   requestAnimationFrame(frame);
 }
-
-// ---------------------------------------------------------------- drawing
 
 function render(): void {
   const dpr = window.devicePixelRatio || 1;
@@ -151,7 +126,6 @@ function render(): void {
     pairs.count = 0;
     const visible = OVERLAP_VISIBLE_FRACTION * 2 * radius;
     meter.measure(sim, radius, targetDepth, (i, j, depth) => {
-      // Resting contacts sit ~0.1-0.5% deep (the engine's tolerance); show only deeper ones
       if (depth < visible || pairs.count === pairs.i.length) { return; }
       pairs.i[pairs.count] = i; pairs.j[pairs.count] = j; pairs.depth[pairs.count] = depth; pairs.count++;
     });
@@ -176,8 +150,6 @@ function render(): void {
   }
 }
 
-// ---------------------------------------------------------------- saving
-
 function buildBlob(): Blob {
   return new Blob(sim!.states.toPieces(), { type: "application/json" });
 }
@@ -192,7 +164,7 @@ function download(blob: Blob, fileName: string): void {
 }
 
 async function saveStates(auto: boolean): Promise<void> {
-  if (saving || !sim) { return; } // previous save still running
+  if (saving || !sim) { return; }
   saving = true;
   try {
     const blob = buildBlob();
@@ -216,7 +188,6 @@ async function saveStates(auto: boolean): Promise<void> {
   }
 }
 
-/** Pick a file to save to (where supported), then save now. */
 async function chooseFileAndSave(): Promise<void> {
   const picker = (window as any).showSaveFilePicker;
   if (picker && !saveHandle) {
@@ -226,13 +197,11 @@ async function chooseFileAndSave(): Promise<void> {
         types: [{ description: "JSON", accept: { "application/json": [".json"] } }],
       });
     } catch {
-      return; // picker cancelled
+      return;
     }
   }
   await saveStates(false);
 }
-
-// ---------------------------------------------------------------- controls
 
 function togglePause(): void {
   paused = !paused;
@@ -248,7 +217,7 @@ async function restart(): Promise<void> {
   if (sim && sim.states.snapshotCount > 0 && !confirm("Restart the simulation? Unsaved states will be lost.")) { return; }
   sim = null;
   await startSimulation();
-  saveHandle = null; // don't overwrite the previous run's file
+  saveHandle = null;
   lastSaveInfo = "not saved yet";
 }
 
@@ -268,17 +237,14 @@ window.addEventListener("beforeunload", (e) => {
   if (sim && sim.states.snapshotCount > 0) { e.preventDefault(); }
 });
 
-// For scripted use (headless browser, console)
 (window as any).biofilm = {
   get sim() { return sim; },
   get overlap() { return lastOverlap; },
   get timing() { return { stepsPerSecond, framesPerSecond, stepMsPerFrame, drawMsPerFrame }; },
-  /** Download all snapshots as one JSON file (same as "Save states…" without the file picker). */
   download: (fileName: string = STATES_FILE_NAME) => { if (sim) { download(buildBlob(), fileName); } },
   pause: () => { if (!paused) { togglePause(); } },
   resume: () => { if (paused) { togglePause(); } },
   advance,
-  /** Zoom into a world area ({minX, minY, maxX, maxY}), or the whole chamber with no argument. */
   setView: (rect?: ViewRect) => { view = rect; },
 };
 

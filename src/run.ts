@@ -1,11 +1,3 @@
-/**
- * Command-line runner: simulate without a browser and write states to disk.
- *
- *   node build/run.js --steps 600000 --out states.json [--seed 42] [--save-every 500]
- *                     [--set rate=0.002 --set anchorLifetimeSteps=6000 ...]
- *                     [--overlap-log overlap.csv [--overlap-check]]
- */
-
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { DEFAULT_PARAMS, SimulationParams } from "./model.js";
@@ -19,7 +11,7 @@ const USAGE = `Usage: node build/run.js --steps N [options]
 Options:
   --steps N         number of simulation steps to run (required)
   --out FILE        output file (default: states.json)
-  --seed N         random seed (default: random; printed at start)
+  --seed N          random seed (default: random; printed at start)
   --save-every N    also save after every N snapshots (default: 500; 0 = only at the end)
   --set KEY=VALUE   override a simulation parameter (repeatable), e.g. --set rate=0.002
   --list-params     print all parameters with their defaults and exit
@@ -99,7 +91,6 @@ function parseArgs(argv: string[]) {
   return opts;
 }
 
-/** Write the file piece by piece to a temp file, then rename: never leaves a half-written file. */
 function save(sim: Simulation, out: string): void {
   const tmp = `${out}.tmp`;
   const fd = fs.openSync(tmp, "w");
@@ -121,8 +112,6 @@ function formatDuration(seconds: number): string {
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   const out = path.resolve(opts.out);
-  // Create the output folders now, and check the states file can be written, rather than failing
-  // at the first save after the simulation has already run
   try {
     for (const file of [out, opts.overlapLog, opts.timingLog]) {
       if (file) { fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true }); }
@@ -143,13 +132,12 @@ async function main(): Promise<void> {
   const changed = Object.entries(opts.overrides).filter(([k]) => k !== "seed");
   if (changed.length > 0) { console.error(`overrides: ${changed.map(([k, v]) => `${k}=${v}`).join(", ")}`); }
 
-  // Overlap check
   const width = 2 * sim.params.radius;
   const targetDepth = opts.overlapTarget * width;
   const meter = new OverlapMeter();
   let overlapFd: number | null = null;
   let last: OverlapStats | null = null;
-  let worst: OverlapStats | null = null; // deepest after the warm-up
+  let worst: OverlapStats | null = null;
   let snapshotsChecked = 0, snapshotsOverTarget = 0, meanSum = 0;
   if (opts.overlapLog) {
     overlapFd = fs.openSync(path.resolve(opts.overlapLog), "w");
@@ -158,7 +146,6 @@ async function main(): Promise<void> {
       `= ${targetDepth.toFixed(3)} after step ${opts.overlapWarmup}`);
   }
 
-  // Step time (physics only: measured around sim.step(), excluding saving and the overlap check)
   let timingFd: number | null = null;
   let stepMs = 0, stepsTimed = 0;
   if (opts.timingLog) {
@@ -167,7 +154,7 @@ async function main(): Promise<void> {
   }
 
   let interrupted = false;
-  process.on("SIGINT", () => { interrupted = true; }); // Ctrl+C: stop after the current step and save
+  process.on("SIGINT", () => { interrupted = true; });
 
   const start = Date.now();
   let lastReport = start;
@@ -178,7 +165,6 @@ async function main(): Promise<void> {
     try {
       snapshotTaken = sim.step();
     } catch (e) {
-      // The physics engine failed (e.g. a WebAssembly trap): keep what was recorded so far
       console.error(`ERROR: the simulation failed at step ${sim.stepCount + 1}:`, e);
       console.error(`saving the ${sim.states.snapshotCount} snapshots recorded so far...`);
       save(sim, out);

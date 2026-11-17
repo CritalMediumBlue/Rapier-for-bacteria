@@ -1,0 +1,196 @@
+---
+title: "Randomness and records"
+subtitle: "`src/rng.ts` and `src/states.ts`: reproducible runs, and the snapshots they produce"
+---
+
+Two small modules make runs reproducible and their results usable: a seeded random number
+generator, so that the same seed always gives the same run, and a recorder that keeps the
+snapshots and the family tree of the cells and writes them as one JSON file.
+
+## Random numbers
+
+JavaScript's `Math.random` cannot be seeded, so the simulation uses its own generator. *Mulberry32*
+is a tiny, fast generator with a 32-bit state: each call advances the state by a constant and
+scrambles it with a few multiplications and shifts. Its quality is far beyond what a simulation like
+this needs, and it is fully determined by its seed.
+
+```{.typescript file=src/rng.ts}
+<<rng-type>>
+
+<<rng-mulberry32>>
+
+<<rng-random-seed>>
+```
+
+A generator is just a function that returns numbers in $[0, 1)$, like `Math.random`:
+
+```{.typescript #rng-type}
+export type Rng = () => number;
+```
+
+```{.typescript #rng-mulberry32}
+export function mulberry32(seed: number): Rng {
+  let a = seed >>> 0;
+  return (): number => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+```
+
+When no seed is given, one is drawn from `Math.random`. The simulation reports it in
+`params.seed`, and the runner and the viewer print it, so any run can be repeated exactly.
+
+```{.typescript #rng-random-seed}
+export function randomSeed(): number {
+  return Math.floor(Math.random() * 4294967296);
+}
+```
+
+::: {.callout-tip}
+## Same seed, same run
+
+A seed fixes every random choice: the initial cells, friction coefficients, division lengths and
+shares, deaths and anchors. The physics engine is deterministic on a given machine, so the same
+seed and parameters give a byte-identical states file. That is why the simulation takes care to
+draw its random numbers in a fixed order (see [the death check](simulation.qmd#leaving-the-chamber-and-death)).
+:::
+
+## Recording states
+
+The recorder writes the format the original model wrote (its `LowRes.json` files), so existing
+analysis scripts read the output unchanged:
+
+```json
+{"1":[{"x":3.99,"y":166.12,"id":1,"an":0.46,"le":3.7}, ...], "2":[...], ..., "lineage":{"1":0, ...}}
+```
+
+- The keys `"1"`, `"2"`, … number the snapshots. Each holds the cells of that snapshot, sorted by
+  id.
+- `x`, `y` is the cell's centre, `an` its [orientation](model.qmd#orientation) as a fraction of π,
+  and `le` its length (distance between the end-cap centres); all are rounded to 2 decimals.
+- `lineage`, written last, maps every cell id to its mother's id, with 0 for the initial cells. It
+  includes cells that divided or left between two snapshots and so appear in no snapshot.
+
+```{.typescript file=src/states.ts}
+<<states-cell-state>>
+
+<<states-round>>
+
+export class StateRecorder {
+  <<states-fields>>
+
+  <<states-counts>>
+
+  <<states-add-lineage>>
+
+  <<states-add-snapshot>>
+
+  <<states-to-pieces>>
+}
+```
+
+A cell's recorded state has exactly the fields of the file format:
+
+```{.typescript #states-cell-state}
+export interface CellState {
+  x: number;
+  y: number;
+  id: number;
+  an: number;
+  le: number;
+}
+```
+
+Values are rounded to two decimals, the coarse graining of the LowRes format. (This rounding alone
+can move a cell's tip by a few hundredths of a unit, which is why overlaps are measured on the live
+simulation, not on the recorded files.)
+
+```{.typescript #states-round}
+export function round2(v: number): number {
+  return Math.round(v * 100) / 100;
+}
+```
+
+### Keeping memory small
+
+A long run records thousands of snapshots of ~1750 cells each. Kept as JavaScript objects, they
+would take much more memory than their text, so each snapshot is turned into its JSON text as soon
+as it is taken, and only the text is kept. The lineage is an array indexed by cell id, since
+ids are consecutive integers.
+
+```{.typescript #states-fields}
+private readonly snapshotParts: string[] = [];
+private readonly lineage: number[] = [];
+private maxId: number = 0;
+```
+
+```{.typescript #states-counts}
+public get snapshotCount(): number {
+  return this.snapshotParts.length;
+}
+
+public get idCount(): number {
+  return this.maxId;
+}
+```
+
+The simulation reports every new cell with its parent:
+
+```{.typescript #states-add-lineage}
+public addLineage(childId: number, parentId: number): void {
+  this.lineage[childId] = parentId;
+  if (childId > this.maxId) { this.maxId = childId; }
+}
+```
+
+`addSnapshot` sorts the cells by id, rounds their values and stores the snapshot's JSON entry,
+`"n":[...]`:
+
+```{.typescript #states-add-snapshot}
+public addSnapshot(cells: CellState[]): void {
+  const sorted = cells.slice().sort((a, b) => a.id - b.id);
+  const text = sorted.map((c) => JSON.stringify({
+    x: round2(c.x),
+    y: round2(c.y),
+    id: c.id,
+    an: round2(c.an),
+    le: round2(c.le),
+  })).join(",");
+  this.snapshotParts.push(`"${this.snapshotParts.length + 1}":[${text}]`);
+}
+```
+
+### Writing the file
+
+The complete file of a long run is about 190 MB. Joining it into one string would need that much
+memory again at the moment of saving, close to the longest string a JavaScript engine allows. So
+the recorder never builds it as one string: `toPieces` returns the file as a list of pieces, in
+order. The runner writes them to disk one by one, and the browser passes them to a `Blob`, which
+stores them without building a JavaScript string. The lineage is split into pieces of 10 000
+entries for the same reason.
+
+```{.typescript #states-to-pieces}
+public toPieces(): string[] {
+  const pieces: string[] = ["{"];
+  this.snapshotParts.forEach((part, i) => {
+    if (i > 0) { pieces.push(","); }
+    pieces.push(part);
+  });
+  if (this.snapshotParts.length > 0) { pieces.push(","); }
+  pieces.push(`"lineage":{`);
+  const CHUNK = 10000;
+  for (let start = 1; start <= this.maxId; start += CHUNK) {
+    const entries: string[] = [];
+    for (let id = start; id < start + CHUNK && id <= this.maxId; id++) {
+      entries.push(`"${id}":${this.lineage[id]}`);
+    }
+    pieces.push((start > 1 ? "," : "") + entries.join(","));
+  }
+  pieces.push("}}");
+  return pieces;
+}
+```

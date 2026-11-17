@@ -1,0 +1,59 @@
+/*-- scss:defaults --*/
+$font-family-sans-serif: "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+$font-family-monospace: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+$code-block-font-size: 0.82rem;
+
+/*-- scss:rules --*/
+body { font-feature-settings: "cv11", "ss01"; }
+
+/* Show code exactly as typed: no ligatures turning === into ≡ or => into ⇒ */
+pre, code { font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; }
+
+/* File and block headers of the literate program */
+.code-with-filename .code-with-filename-file {
+  padding: 0.3rem 0.75rem;
+  border-radius: 0.4rem 0.4rem 0 0;
+}
+.code-with-filename .code-with-filename-file pre strong {
+  font-weight: 600;
+  font-size: 0.78rem;
+}
+.code-with-filename:has(pre.literate-file) .code-with-filename-file {
+  background: rgba(var(--bs-primary-rgb), 0.14);
+}
+.code-with-filename:has(pre.literate-file) .code-with-filename-file pre strong::before {
+  content: "📄 ";
+}
+
+/* «name» references inside code */
+.noweb-ref {
+  font-style: italic;
+  color: var(--bs-primary);
+  text-decoration: none;
+  border-bottom: 1px dotted currentColor;
+}
+a.noweb-ref:hover { border-bottom-style: solid; }
+
+/* The call to action on the overview page */
+.hero {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.5rem;
+  align-items: center;
+  margin: 1.5rem 0 2rem;
+}
+.hero img {
+  flex: 1 1 22rem;
+  max-width: 100%;
+  border-radius: 0.5rem;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
+}
+.hero .hero-text { flex: 1 1 16rem; }
+.hero .btn { margin-top: 0.5rem; }
+
+/* Parameter tables */
+.parameters td:first-child, .parameters td:nth-child(2) {
+  font-family: $font-family-monospace;
+  font-size: 0.85em;
+  white-space: nowrap;
+}

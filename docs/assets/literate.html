@@ -1,0 +1,22 @@
+<script>
+// Turns Entangled references in code blocks into links: a line that is only `<<name>>` becomes
+// «name», linking to the block of that name on the same page.
+document.addEventListener("DOMContentLoaded", () => {
+  const reference = /^(\s*)<<([A-Za-z0-9_-]+)>>\s*$/;
+  for (const line of document.querySelectorAll("div.sourceCode pre code > span")) {
+    const match = reference.exec(line.textContent);
+    if (!match) { continue; }
+    const [, indent, name] = match;
+    const lineAnchor = line.querySelector("a[aria-hidden]");
+    line.textContent = "";
+    if (lineAnchor) { line.append(lineAnchor); }
+    line.append(indent);
+    const target = document.getElementById(name);
+    const link = document.createElement(target ? "a" : "span");
+    if (target) { link.href = `#${name}`; }
+    link.className = "noweb-ref";
+    link.textContent = `«${name}»`;
+    line.append(link);
+  }
+});
+</script>

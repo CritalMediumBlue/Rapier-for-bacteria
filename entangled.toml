@@ -1,0 +1,19 @@
+version = "2.4"
+watch_list = ["docs/**/*.qmd"]
+annotation = "naked"
+hooks = ["~shebang"]
+
+[[languages]]
+name = "TypeScript"
+identifiers = ["typescript", "ts"]
+comment = { open = "//" }
+
+[[languages]]
+name = "HTML"
+identifiers = ["html"]
+comment = { open = "<!--", close = "-->" }
+
+[[languages]]
+name = "Mermaid"
+identifiers = ["mermaid"]
+comment = { open = "%%" }

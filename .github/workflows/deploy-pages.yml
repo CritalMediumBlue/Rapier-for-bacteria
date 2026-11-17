@@ -1,7 +1,8 @@
-# Build the browser version of the bacteria simulation and publish it on GitHub Pages:
-#   https://<owner>.github.io/<repo>/
-# Requires Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
-name: Deploy simulation to GitHub Pages
+# Build the website and publish it on GitHub Pages:
+#   https://<owner>.github.io/<repo>/             the literate program (Quarto)
+#   https://<owner>.github.io/<repo>/simulation/  the simulation
+# Also checks that the committed source files are exactly what the literate program tangles to.
+name: Deploy site to GitHub Pages
 
 on:
   push:
@@ -26,9 +27,21 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - uses: quarto-dev/quarto-actions/setup@v2
+        with:
+          version: 1.8.25
       - name: Install dependencies
-        run: npm ci --no-audit --no-fund
-      - name: Build the simulation and assemble the site
+        run: |
+          npm ci --no-audit --no-fund
+          pip install entangled-cli==2.4.0
+      - name: Check that src/ and index.html match the literate program
+        run: |
+          npm run tangle
+          git diff --exit-code -- src index.html
+      - name: Build the simulation and the documentation, and assemble the site
         run: npm run build-site
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v4
